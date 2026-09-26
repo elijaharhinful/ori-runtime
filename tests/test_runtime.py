@@ -2982,6 +2982,242 @@ class TestShutdown:
         assert observed["decision"]["status"] == "critical"
 
 
+class TestTierCProposalsAcrossTheProcess:
+    """The runtime settles proposals at start and closes them at a graceful stop."""
+
+    @staticmethod
+    async def _seed_proposal(db_path, state: str) -> None:
+        from ori.reasoning import tier_c_admission as adm
+        from ori.state.store import StateStore
+
+        store = StateStore(str(db_path))
+        await store.open()
+        try:
+            assert (
+                await store.create_tier_c_proposal(
+                    proposal_id="P1",
+                    device_id="test-device-01",
+                    action="trip_relay",
+                    target="relay-gpio-26",
+                    zone_id="zone-a",
+                    outcome="open_protected_circuit",
+                    safe_default_action="log_to_dashboard",
+                    binding_digest="sha256:" + "b" * 64,
+                    authority_json="{}",
+                    created_at_ms=1,
+                    expires_at_ms=2,
+                )
+                == "committed"
+            )
+            if state != adm.PROPOSED:
+                assert (
+                    await store.admit_tier_c_approval(
+                        "P1",
+                        binding_digest="sha256:" + "b" * 64,
+                        authority_json="{}",
+                        reservation_ceiling=64,
+                    )
+                    == "committed"
+                )
+        finally:
+            await store.close()
+
+    @staticmethod
+    async def _state(db_path) -> str:
+        from ori.state.store import StateStore
+
+        store = StateStore(str(db_path))
+        await store.open()
+        try:
+            row = await store.get_tier_c_proposal("P1")
+            return str(row["decision_state"]) if row else "missing"
+        finally:
+            await store.close()
+
+    async def test_start_settles_what_a_previous_process_left(
+        self, minimal_config, monkeypatch, tmp_path
+    ):
+        """An open proposal closes; an approval without an outcome is not proven."""
+        from ori.reasoning import tier_c_admission as adm
+
+        _patch_external(monkeypatch)
+        db_path = tmp_path / "ori_state.db"
+        await self._seed_proposal(db_path, adm.APPROVED_PENDING_DISPATCH)
+        runtime: Any = OriRuntime(config_path=str(minimal_config))
+
+        async def _observe_then_stop():
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 15.0
+            while not runtime._startup_complete:
+                if loop.time() > deadline:
+                    raise AssertionError("startup never completed")
+                await asyncio.sleep(0.02)
+            await runtime.stop()
+
+        await asyncio.gather(runtime.start(), _observe_then_stop())
+        assert await self._state(db_path) == adm.DISPATCH_NOT_PROVEN
+
+    async def test_an_open_proposal_closed_at_start_runs_its_alert_safe_default(
+        self, minimal_config, monkeypatch, tmp_path
+    ):
+        """Recovery runs after every executor is registered, so an alert default runs."""
+        from ori.reasoning import tier_c_admission as adm
+        from ori.state.store import StateStore
+
+        _patch_external(monkeypatch)
+        submitted: list[str] = []
+
+        async def _submit(self, alert, to_number):
+            submitted.append(str(alert.sms_body))
+            return AlertSendReceipt.accepted_without_provider_receipt(channel="sms")
+
+        monkeypatch.setattr("ori.actions.sms.SMSAction.submit", _submit)
+        db_path = tmp_path / "ori_state.db"
+        store = StateStore(str(db_path))
+        await store.open()
+        try:
+            assert (
+                await store.create_tier_c_proposal(
+                    proposal_id="P1",
+                    device_id="test-device-01",
+                    action="trip_relay",
+                    target="relay-gpio-26",
+                    zone_id="zone-a",
+                    outcome="open_protected_circuit",
+                    safe_default_action="alert_sms",
+                    binding_digest="sha256:" + "b" * 64,
+                    authority_json="{}",
+                    created_at_ms=1,
+                    expires_at_ms=2,
+                )
+                == "committed"
+            )
+        finally:
+            await store.close()
+        # The alert reaches the outbox only through a configured channel and
+        # an operator to send it to; the fixture has neither.
+        import yaml
+
+        raw = yaml.safe_load(minimal_config.read_text(encoding="utf-8"))
+        raw["actions"]["sms"] = {
+            "enabled": True,
+            "transport": "ip",
+            "AT_API_KEY": "test-key",
+            "AT_USERNAME": "sandbox",
+            "to_number": "+2348000000000",
+        }
+        raw["actions"]["operator_contact"] = "+2348000000000"
+        alerting = minimal_config.parent / "ori-alerting.yaml"
+        alerting.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+        runtime: Any = OriRuntime(config_path=str(alerting))
+
+        async def _observe_then_stop():
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 15.0
+            while not runtime._startup_complete:
+                if loop.time() > deadline:
+                    raise AssertionError("startup never completed")
+                await asyncio.sleep(0.02)
+            await runtime.stop()
+
+        await asyncio.gather(runtime.start(), _observe_then_stop())
+        store = StateStore(str(db_path))
+        await store.open()
+        try:
+            row = await store.get_tier_c_proposal("P1")
+            intents = await store.get_tier_c_safe_default_intents("P1")
+        finally:
+            await store.close()
+        assert row is not None
+        assert row["decision_state"] == adm.PROPOSAL_ABORTED_RESTART
+        assert [(i["action"], i["outcome"]) for i in intents] == [
+            ("alert_sms", "executed")
+        ]
+        # The provider was handed the notice, and it names the proposal.
+        assert any("P1" in body for body in submitted), submitted
+
+    async def test_a_failing_recovery_refuses_tier_c_and_lets_the_start_finish(
+        self, minimal_config, monkeypatch, tmp_path
+    ):
+        """Tier C fails closed on its own; Tier D and the sensor loops still start."""
+        from ori.state.store import StateStore
+
+        _patch_external(monkeypatch)
+
+        async def _unreadable(self, *states):
+            raise RuntimeError("tier_c_proposals unreadable")
+
+        monkeypatch.setattr(StateStore, "get_tier_c_proposals", _unreadable)
+        runtime: Any = OriRuntime(config_path=str(minimal_config))
+        seen: dict[str, Any] = {}
+
+        async def _observe_then_stop():
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 15.0
+            while not runtime._startup_complete:
+                if loop.time() > deadline:
+                    raise AssertionError("startup never completed")
+                await asyncio.sleep(0.02)
+            dispatcher = runtime._dispatcher
+            seen["failed"] = dispatcher._tier_c_recovery_failed
+            seen["degraded"] = dispatcher.action_records_degrade_health()
+            await runtime.stop()
+
+        await asyncio.gather(runtime.start(), _observe_then_stop())
+        assert seen["failed"].startswith("RuntimeError")
+        assert seen["degraded"] is True
+
+    async def test_a_graceful_stop_closes_an_open_proposal(
+        self, minimal_config, monkeypatch, tmp_path
+    ):
+        from ori.reasoning import tier_c_admission as adm
+        from ori.state.store import StateStore
+
+        _patch_external(monkeypatch)
+        db_path = tmp_path / "ori_state.db"
+        runtime: Any = OriRuntime(config_path=str(minimal_config))
+
+        async def _open_then_stop():
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 15.0
+            while not runtime._startup_complete:
+                if loop.time() > deadline:
+                    raise AssertionError("startup never completed")
+                await asyncio.sleep(0.02)
+            store = runtime._state_store
+            assert isinstance(store, StateStore)
+            assert (
+                await store.create_tier_c_proposal(
+                    proposal_id="P1",
+                    device_id="test-device-01",
+                    action="trip_relay",
+                    target="relay-gpio-26",
+                    zone_id="zone-a",
+                    outcome="open_protected_circuit",
+                    safe_default_action="log_to_dashboard",
+                    binding_digest="sha256:" + "b" * 64,
+                    authority_json="{}",
+                    created_at_ms=1,
+                    expires_at_ms=2,
+                )
+                == "committed"
+            )
+            await runtime.stop()
+
+        await asyncio.gather(runtime.start(), _open_then_stop())
+        store = StateStore(str(db_path))
+        await store.open()
+        try:
+            row = await store.get_tier_c_proposal("P1")
+            intents = await store.get_tier_c_safe_default_intents("P1")
+        finally:
+            await store.close()
+        assert row is not None
+        assert row["decision_state"] == adm.PROPOSAL_ABORTED_RESTART
+        assert row["state_reason"] == "graceful_shutdown"
+        assert [i["proposal_id"] for i in intents] == ["P1"]
+
+
 class TestWatchdog:
     async def test_watchdog_skipped_gracefully_without_device(
         self, minimal_config, monkeypatch, caplog
