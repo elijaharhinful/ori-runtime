@@ -225,6 +225,9 @@ class Replay:
             )
         ).decode("ascii")
         self.critical: list[str] = []
+        # Set by the operator-socket corpus, which submits every local
+        # reconcile through the socket and the bridge rather than the dispatcher.
+        self.operator_transport: Any = None
         monkeypatch.setattr(dispatcher_module, "now_ms", lambda: self.wall_ms)
         monkeypatch.setattr(offline_tokens_module, "now_ms", lambda: self.wall_ms)
         monkeypatch.setattr(dispatcher_module, "_generate_proposal_id", self._next_id)
@@ -810,6 +813,15 @@ async def _run(replay: Replay, sequence: dict[str, Any], caplog: Any) -> list[st
                     )
 
                 await _until(acted)
+                if replay.marker_durable:
+                    # The marker is written beside the act, never awaited by
+                    # it; a loaded runner lands it after the actuation.
+                    async def marked() -> bool:
+                        return (
+                            await replay.state_of(main) != adm.APPROVED_PENDING_DISPATCH
+                        )
+
+                    await _until(marked)
                 await _turns()
                 replay.dispatch_released.clear()
                 t = replay.tasks.get(main)
@@ -916,6 +928,11 @@ async def _run(replay: Replay, sequence: dict[str, Any], caplog: Any) -> list[st
         if event == "reconcile":
             assert replay.dispatcher is not None and replay.store is not None
             source = step.get("source")
+            if source == "operator_local" and replay.operator_transport is not None:
+                unrepresented += await replay.operator_transport(
+                    replay, step, main, caplog
+                )
+                continue
             if source == "operator_local":
                 caller = step.get("caller", {})
                 if (
