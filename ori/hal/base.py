@@ -4,6 +4,7 @@
 import asyncio
 import enum
 import logging
+import math
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
@@ -36,6 +37,62 @@ class MeasurementRefusedError(AdapterReadError):
     tracking and the operator alert that depend on it, while every arithmetic
     test stays green.
     """
+
+
+# The largest value an SQLite INTEGER column holds; history timestamps are one.
+_SQLITE_INT_MAX = 2**63 - 1
+
+
+def refuse_quality_above_one(reading: Any) -> None:
+    """Refuse a numeric quality above 1, outside the reading's defined domain.
+
+    Only this is refused ahead of the safety registry: every other unusable
+    quality is the registry's own rejected input, which owes an immediate alert.
+    """
+    quality = reading.quality
+    if (
+        isinstance(quality, (int, float))
+        and not isinstance(quality, bool)
+        and quality > 1
+    ):
+        raise MeasurementRefusedError("reading quality is above 1")
+
+
+def refuse_unusable_reading(reading: Any) -> None:
+    """Refuse a reading that cannot be stored, compared or evaluated.
+
+    A non-finite value compares false against every threshold, and a timestamp
+    outside the store's integer range cannot be persisted. Either arrives from
+    one message a sensor passes through, so it is refused as a measurement
+    rather than counted as a live reading that then fails before evaluation.
+    """
+    value = reading.value
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MeasurementRefusedError(f"reading value {value!r} is not a number")
+    # math.isfinite raises converting an int past float range, and the store
+    # cannot bind an int past its integer range.
+    if isinstance(value, int):
+        if not -_SQLITE_INT_MAX - 1 <= value <= _SQLITE_INT_MAX:
+            raise MeasurementRefusedError("reading value is out of range")
+    elif not math.isfinite(value):
+        raise MeasurementRefusedError(f"reading value {value!r} is not finite")
+    timestamp = reading.timestamp
+    if (
+        isinstance(timestamp, bool)
+        or not isinstance(timestamp, int)
+        or not 0 <= timestamp <= _SQLITE_INT_MAX
+    ):
+        raise MeasurementRefusedError(
+            f"reading timestamp {timestamp!r} is out of range"
+        )
+    quality = reading.quality
+    if (
+        isinstance(quality, bool)
+        or not isinstance(quality, (int, float))
+        or (isinstance(quality, float) and not math.isfinite(quality))
+        or not 0.0 <= quality <= 1.0
+    ):
+        raise MeasurementRefusedError(f"reading quality {quality!r} is not in 0..1")
 
 
 class CircuitState(enum.Enum):

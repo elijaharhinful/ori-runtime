@@ -85,7 +85,13 @@ from ori.gateway.node_heartbeat import (
     MqttRuntimeNodeHeartbeatPublisher,
 )
 from ori.gateway.reasoning import MqttGatewayReasoner
-from ori.hal.base import AdapterReadError, BaseAdapter, MeasurementRefusedError
+from ori.hal.base import (
+    AdapterReadError,
+    BaseAdapter,
+    MeasurementRefusedError,
+    refuse_quality_above_one,
+    refuse_unusable_reading,
+)
 from ori.hal.protocol_registry import UnknownProtocolError, make_adapter
 from ori.hardware.led_indicator import (
     LEDIndicator,
@@ -4060,6 +4066,9 @@ class OriRuntime:
         while not self._shutdown_event.is_set():
             try:
                 reading = await adapter.read(sensor_cfg.id)
+                # Outside the reading's quality domain, this is a refused window
+                # rather than an input the safety profile can judge.
+                refuse_quality_above_one(reading)
                 # The safety registry consumes every reading synchronously,
                 # before deduplication, history, the EventBus, or any skill:
                 # a duplicate is irrelevant to skills and still matters to
@@ -4078,6 +4087,11 @@ class OriRuntime:
                                 decision.pair[1],
                                 decision.driver_accepted,
                             )
+                # After the registry, which judges the value itself, and before
+                # anything counts the sensor as seen: a reading that cannot be
+                # stored or compared would otherwise mark the sensor live and
+                # then fail on every poll before any skill evaluated it.
+                refuse_unusable_reading(reading)
                 self._sensor_last_seen_ms[sensor_cfg.id] = now_ms()
                 await self._note_measurement_accepted(str(sensor_cfg.id))
                 if sensor_cfg.id in self._stale_sensor_active:

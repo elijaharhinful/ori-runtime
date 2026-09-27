@@ -1,11 +1,14 @@
 # Copyright 2026 Ori Nexus Systems LTD
 # SPDX-License-Identifier: Apache-2.0
 
-import json
 from typing import Any
 
 from ori.hal.base import AdapterConnectionError, AdapterReadError
-from ori.hal.mqtt_base import MQTT_CONNECTION_SCHEMA, MqttCachedAdapter
+from ori.hal.mqtt_base import (
+    MQTT_CONNECTION_SCHEMA,
+    MqttCachedAdapter,
+    load_json_payload,
+)
 from ori.network.events import SensorReading
 from ori.utils.time_utils import now_ms
 
@@ -82,6 +85,7 @@ class MqttPerceptionAdapter(MqttCachedAdapter):
             )
 
         async with self._breaker:
+            self._require_listener()
             cached = self._cache.get(self._topic)
             if cached is None:
                 raise AdapterReadError(
@@ -122,12 +126,7 @@ class MqttPerceptionAdapter(MqttCachedAdapter):
         if not text:
             raise AdapterReadError("Perception payload is empty")
 
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise AdapterReadError(
-                f"Perception payload is not valid JSON: {exc}"
-            ) from exc
+        parsed = load_json_payload(text, "MQTT")
         if not isinstance(parsed, dict):
             raise AdapterReadError("Perception payload must be a JSON object")
 
