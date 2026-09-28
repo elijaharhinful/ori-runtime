@@ -18,6 +18,7 @@ import pytest
 
 from ori.actions.alert_failover import AlertFailoverSender
 from ori.hal.ac_measurement import WindowRefusedError, WindowSpec, summarise_window
+from ori.state.deferred_writer import DeferredWriter
 
 
 @contextlib.contextmanager
@@ -561,6 +562,13 @@ def test_refusal_is_checked_before_the_arithmetic_runs() -> None:
 # ── refusal handling in the runtime ───────────────────────────────────────────
 
 
+def _with_measurement_writer(runtime: Any) -> None:
+    """The measurement-state writer a bare runtime needs, as __init__ builds it."""
+    runtime._measurement_writer = DeferredWriter("measurement", ceiling=256)
+    runtime._measurement_reconciling = set()
+    runtime._measurement_disk_recovered = set()
+
+
 class _Runtime:
     """The refusal bookkeeping, lifted off OriRuntime so it can be driven directly."""
 
@@ -576,6 +584,7 @@ class _Runtime:
         self.runtime._measurement_notify_attempts = {}
         self.runtime._measurement_degraded_since = {}
         self.runtime._measurement_notice_stage = {}
+        _with_measurement_writer(self.runtime)
         self.runtime._secondary_contact = ""
         self.runtime._alert_sender = None
         self.runtime._state_store = None
@@ -600,6 +609,11 @@ class _Runtime:
     async def accept(self, times: int, sensor_id: str = "load-current") -> None:
         for _ in range(times):
             await self.runtime._note_measurement_accepted(sensor_id)
+            await self.settle()
+
+    async def settle(self) -> None:
+        """Let any measurement write queued beside a reading land."""
+        await self.runtime._measurement_writer.drain(5.0)
 
     @property
     def degraded(self) -> set:
@@ -821,6 +835,7 @@ class _EscalationHarness:
         from ori.runtime import OriRuntime
 
         self.runtime = OriRuntime.__new__(OriRuntime)
+        _with_measurement_writer(self.runtime)
         self.runtime._measurement_degraded = {"load-current"}
         self.runtime._measurement_unnotified = set()
         self.runtime._measurement_degraded_since = {"load-current": 0}
@@ -1392,3 +1407,239 @@ async def test_a_write_for_an_absent_row_creates_it(tmp_path) -> None:
         assert await store.get_measurement_degradation() == {"never-degraded": True}
     finally:
         await store.close()
+
+
+# ── recovery is recorded beside the reading ───────────────────────────────────
+
+
+class _RecoveryStore:
+    """Records clears and degradations; a clear can be held or fail."""
+
+    def __init__(self, *, fail_first: bool = False, fail_restore: int = 0) -> None:
+        self.release = asyncio.Event()
+        self.release.set()
+        self.restore_release = asyncio.Event()
+        self.restore_release.set()
+        self.clears = 0
+        self.degraded: list[tuple[str, bool]] = []
+        self.on_disk: set[str] = set()
+        self._fail_first = fail_first
+        self._fail_restore = fail_restore
+
+    async def clear_measurement_degraded(self, sensor_id: str) -> None:
+        self.clears += 1
+        await self.release.wait()
+        if self._fail_first:
+            self._fail_first = False
+            raise RuntimeError("store refused the recovery")
+        self.on_disk.discard(sensor_id)
+
+    async def set_measurement_degraded(self, sensor_id: str, *, notified: bool) -> None:
+        self.degraded.append((sensor_id, notified))
+        if self.clears:
+            await self.restore_release.wait()
+        # Only a restore follows a clear; the initial degradation never fails.
+        if self._fail_restore and self.clears:
+            self._fail_restore -= 1
+            raise RuntimeError("store refused the restore")
+        self.on_disk.add(sensor_id)
+
+
+async def _degraded_harness(store: _RecoveryStore) -> _Runtime:
+    from ori.runtime import MEASUREMENT_REFUSALS_BEFORE_DEGRADED
+
+    harness = _Runtime()
+    harness.runtime._state_store = cast(Any, store)
+    await harness.refuse(MEASUREMENT_REFUSALS_BEFORE_DEGRADED)
+    store.degraded.clear()
+    return harness
+
+
+async def test_a_pending_recovery_is_recorded_once_and_clears_memory_after() -> None:
+    from ori.runtime import MEASUREMENT_WINDOWS_TO_RECOVER
+
+    store = _RecoveryStore()
+    harness = await _degraded_harness(store)
+    store.release.clear()
+    for _ in range(MEASUREMENT_WINDOWS_TO_RECOVER + 3):
+        # A recovery awaited on the reading's path would never return here.
+        await asyncio.wait_for(
+            harness.runtime._note_measurement_accepted("load-current"), 1.0
+        )
+        await asyncio.sleep(0)
+
+    assert store.clears == 1, "a pending recovery was queued again"
+    assert harness.degraded == {"load-current"}, "memory cleared before the disk"
+    store.release.set()
+    await harness.settle()
+    assert harness.degraded == set()
+
+
+async def test_a_failed_recovery_is_counted_and_retried() -> None:
+    from ori.runtime import MEASUREMENT_WINDOWS_TO_RECOVER
+
+    store = _RecoveryStore(fail_first=True)
+    harness = await _degraded_harness(store)
+    await harness.accept(MEASUREMENT_WINDOWS_TO_RECOVER)
+
+    assert harness.runtime._measurement_writer.lost == 1
+    assert harness.degraded == {"load-current"}
+    await harness.accept(1)
+    assert store.clears == 2
+    assert harness.degraded == set()
+
+
+async def test_a_refusal_during_a_pending_recovery_keeps_the_disk_degraded() -> None:
+    from ori.runtime import MEASUREMENT_WINDOWS_TO_RECOVER
+
+    store = _RecoveryStore()
+    harness = await _degraded_harness(store)
+    store.release.clear()
+    for _ in range(MEASUREMENT_WINDOWS_TO_RECOVER):
+        await asyncio.wait_for(
+            harness.runtime._note_measurement_accepted("load-current"), 1.0
+        )
+    await harness.refuse(1)
+    store.release.set()
+    await harness.settle()
+
+    assert harness.degraded == {"load-current"}
+    assert store.degraded == [("load-current", True)], (
+        "the cleared disk was not put back to degraded"
+    )
+
+
+async def test_a_failed_restore_is_counted_and_owed_until_the_disk_agrees() -> None:
+    """Disk recovered, memory degraded: the restore is retried, never dropped."""
+    from ori.runtime import MEASUREMENT_WINDOWS_TO_RECOVER
+
+    store = _RecoveryStore(fail_restore=1)
+    harness = await _degraded_harness(store)
+    store.on_disk.add("load-current")
+    store.release.clear()
+    for _ in range(MEASUREMENT_WINDOWS_TO_RECOVER):
+        await asyncio.wait_for(
+            harness.runtime._note_measurement_accepted("load-current"), 1.0
+        )
+    await harness.refuse(1)
+    store.release.set()
+    await harness.settle()
+
+    # The clear landed, the restore was refused: the disk says recovered
+    # while the sensor is degraded, and that is counted and still owed.
+    assert "load-current" not in store.on_disk
+    assert harness.degraded == {"load-current"}
+    assert harness.runtime._measurement_writer.lost == 1
+    assert harness.runtime._measurement_disk_recovered == {"load-current"}
+
+    await harness.refuse(1)
+    await harness.settle()
+    assert "load-current" in store.on_disk
+    assert harness.runtime._measurement_disk_recovered == set()
+
+
+async def test_a_recovery_after_a_refused_restore_needs_no_second_clear() -> None:
+    from ori.runtime import MEASUREMENT_WINDOWS_TO_RECOVER
+
+    store = _RecoveryStore(fail_restore=10)
+    harness = await _degraded_harness(store)
+    store.release.clear()
+    for _ in range(MEASUREMENT_WINDOWS_TO_RECOVER):
+        await asyncio.wait_for(
+            harness.runtime._note_measurement_accepted("load-current"), 1.0
+        )
+    await harness.refuse(1)
+    store.release.set()
+    await harness.settle()
+    clears = store.clears
+
+    await harness.accept(MEASUREMENT_WINDOWS_TO_RECOVER)
+
+    assert harness.degraded == set()
+    assert harness.runtime._measurement_disk_recovered == set()
+    assert store.clears == clears, "the disk already said recovered"
+
+
+async def test_shutdown_settles_measurement_writes_as_unknown_or_lost(
+    tmp_path,
+) -> None:
+    """A write in flight at close is unknown, one never started is lost.
+
+    Driven against a real store: the writer is closed before the store, the
+    lost clear leaves its sensor degraded on reopen, and nothing is left
+    running against a closed connection.
+    """
+    from ori.runtime import MEASUREMENT_WINDOWS_TO_RECOVER
+
+    store = await _store(tmp_path)
+    harness = _Runtime()
+    harness.runtime._state_store = store
+    for sensor in ("load-current", "grid-voltage"):
+        await store.set_measurement_degraded(sensor, notified=True)
+        harness.runtime._measurement_degraded.add(sensor)
+    held = asyncio.Event()
+    clear = store.clear_measurement_degraded
+
+    async def in_flight(sensor_id: str) -> None:
+        if sensor_id == "load-current":
+            await held.wait()
+        await clear(sensor_id)
+
+    store.clear_measurement_degraded = in_flight  # type: ignore[method-assign]
+    for sensor in ("load-current", "grid-voltage"):
+        for _ in range(MEASUREMENT_WINDOWS_TO_RECOVER):
+            await harness.runtime._note_measurement_accepted(sensor)
+    await asyncio.sleep(0)
+
+    await harness.runtime._close_measurement_writer(grace_s=0.05)
+
+    writer = harness.runtime._measurement_writer
+    assert (writer.unknown, writer.lost) == (1, 1)
+    assert writer.pending == 0
+    assert harness.degraded == {"load-current", "grid-voltage"}
+    await store.close()
+
+    reopened = await _store(tmp_path)
+    assert set(await reopened.get_measurement_degradation()) == {
+        "load-current",
+        "grid-voltage",
+    }
+    await reopened.close()
+
+
+async def test_a_run_completed_during_a_restore_is_cleared_after_it_lands() -> None:
+    """The restore puts the degraded row back; the completed run then clears it.
+
+    Clearing memory while the restore was still in flight would leave the
+    sensor healthy in memory and degraded on disk once the restore landed.
+    """
+    from ori.runtime import MEASUREMENT_WINDOWS_TO_RECOVER
+
+    store = _RecoveryStore()
+    harness = await _degraded_harness(store)
+    store.on_disk.add("load-current")
+    store.release.clear()
+    for _ in range(MEASUREMENT_WINDOWS_TO_RECOVER):
+        await asyncio.wait_for(
+            harness.runtime._note_measurement_accepted("load-current"), 1.0
+        )
+    await harness.refuse(1)
+    store.restore_release.clear()
+    store.release.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert harness.runtime._measurement_disk_recovered == {"load-current"}
+
+    for _ in range(MEASUREMENT_WINDOWS_TO_RECOVER):
+        await asyncio.wait_for(
+            harness.runtime._note_measurement_accepted("load-current"), 1.0
+        )
+    assert harness.degraded == {"load-current"}, (
+        "memory cleared while the restore was still in flight"
+    )
+
+    store.restore_release.set()
+    await harness.settle()
+    assert harness.degraded == set()
+    assert "load-current" not in store.on_disk, "memory and disk disagree"
+    assert store.clears == 2

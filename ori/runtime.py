@@ -242,6 +242,7 @@ from ori.skills.loader import (
     SkillLoader,
 )
 from ori.skills.signing import verify_signed_payload
+from ori.state.deferred_writer import DeferredWriter
 from ori.state.store import StateStore, TripJournal
 from ori.telemetry.http_export import HttpTelemetryExporter
 from ori.utils.bool_utils import is_truthy
@@ -323,6 +324,10 @@ MEASUREMENT_REFUSALS_BEFORE_DEGRADED = 3
 # and flapping between degraded and healthy would produce an alert stream that
 # operators learn to ignore.
 MEASUREMENT_WINDOWS_TO_RECOVER = 5
+#: Measurement-state writes that may wait for a busy store before one is lost.
+MEASUREMENT_WRITER_CEILING = 256
+#: The store's busy timeout: how long a closing writer lets a write in flight land.
+MEASUREMENT_CLOSE_GRACE_S = 5.0
 
 # How many times a degradation warning is retried when it could not be
 # delivered or durably queued. Paced by the poll interval, and bounded so a
@@ -510,6 +515,17 @@ class OriRuntime:
         self._measurement_notify_attempts: dict[str, int] = {}
         self._measurement_degraded_since: dict[str, int] = {}
         self._measurement_notice_stage: dict[str, int] = {}
+        # Recovery is recorded beside the reading, never ahead of it, by one
+        # ordered writer. A sensor has at most one reconciliation pending, and
+        # one whose disk says recovered while it is still degraded is owed a
+        # restore until the disk agrees.
+        self._measurement_writer = DeferredWriter(
+            "measurement",
+            ceiling=MEASUREMENT_WRITER_CEILING,
+            loss_level=logging.WARNING,
+        )
+        self._measurement_reconciling: set[str] = set()
+        self._measurement_disk_recovered: set[str] = set()
         self._runtime_started_at_ms: int = 0
         self._configured_sensors: list[Any] = []
         self._connected_sensor_ids: set[str] = set()
@@ -2127,7 +2143,10 @@ class OriRuntime:
             except Exception:
                 logger.exception("[shutdown] error closing adapter")
 
-        # 4. Close StateStore
+        # 4. Close StateStore, after the measurement writer has settled what
+        #    it can: a write still in flight past its grace is unknown, one
+        #    never started is lost, and both are counted.
+        await self._close_measurement_writer()
         if self._state_store is not None:
             await self._state_store.close()
 
@@ -2457,6 +2476,16 @@ class OriRuntime:
             )
 
         if threshold_key in tier_d_config_keys(skill):
+            admission = getattr(self._state_store, "history_admission", None)
+            if admission is not None and admission.pending > 0:
+                # A reading already evaluated may not be stored yet, so the
+                # latest stored reading cannot stand for the current condition.
+                return command_result(
+                    command,
+                    status=STATUS_PRECONDITION_FAILED,
+                    detail="SET_THRESHOLD for a Tier D key waits until every evaluated reading is stored; retry",
+                    executed=False,
+                )
             readings = await self._latest_readings_for_skill(skill)
             if readings is None:
                 return command_result(
@@ -4121,7 +4150,9 @@ class OriRuntime:
                 # protocol provenance through reading.metadata["source"].
                 event.source = reading.metadata.get("source", "")
                 event.fingerprint = compute_fingerprint(reading, event.device_id)
-                await self._state_store.append_history(event)
+                # Queued, never awaited: a busy store must not delay or drop the
+                # reading's evaluation. Its row lands after, or is counted lost.
+                self._state_store.admit_history(event)
                 if event.reading is not None and deduplicator is not None:
                     if deduplicator.process(event) is None:
                         logger.debug(
@@ -4388,12 +4419,106 @@ class OriRuntime:
         streak = self._measurement_valid_streak.get(sensor_id, 0) + 1
         self._measurement_valid_streak[sensor_id] = streak
         if streak < MEASUREMENT_WINDOWS_TO_RECOVER:
+            self._reconcile_measurement(sensor_id, clear=False)
             return
-        # Persisted before the in-memory state is cleared. The other order
-        # would let a store failure leave a sensor healthy in memory and
-        # degraded on disk, so the next restart resurrects a resolved fault.
-        if not await self._clear_measurement_state(sensor_id):
+        if sensor_id in self._measurement_disk_recovered:
+            if sensor_id in self._measurement_reconciling:
+                # A restore is in flight and will put the degraded row back;
+                # its landing queues the clear this completed run is owed.
+                return
+            # The disk already says recovered, and now memory agrees.
+            self._measurement_disk_recovered.discard(sensor_id)
+            self._finish_measurement_recovery(sensor_id, streak)
             return
+        # Queued, never awaited: recovery is bookkeeping, and the reading that
+        # completed it is evaluated now. The sensor stays degraded in memory
+        # until the clear lands, so memory is never healthier than disk.
+        self._reconcile_measurement(sensor_id, clear=True, streak=streak)
+
+    def _reconcile_measurement(
+        self, sensor_id: str, *, clear: bool, streak: int = 0
+    ) -> None:
+        """Queue the disk write a sensor's measurement state is owed, once.
+
+        *clear* records a completed recovery. Otherwise this restores the
+        degraded row for a sensor whose disk says recovered while it is still
+        degraded, and does nothing for one whose disk already agrees. A write
+        the store refuses is counted lost by the writer; the next window for
+        the sensor queues it again.
+        """
+        if not clear and sensor_id not in self._measurement_disk_recovered:
+            return
+        if sensor_id in self._measurement_reconciling:
+            return
+        store = self._state_store
+        if store is None:
+            if clear:
+                self._finish_measurement_recovery(sensor_id, streak)
+            return
+        self._measurement_reconciling.add(sensor_id)
+
+        async def write_clear() -> None:
+            await store.clear_measurement_degraded(sensor_id)
+            self._measurement_reconciling.discard(sensor_id)
+            self._measurement_cleared_on_disk(sensor_id, streak)
+
+        async def write_restore() -> None:
+            await store.set_measurement_degraded(
+                sensor_id, notified=sensor_id not in self._measurement_unnotified
+            )
+            self._measurement_reconciling.discard(sensor_id)
+            self._measurement_disk_recovered.discard(sensor_id)
+            completed = self._measurement_valid_streak.get(sensor_id, 0)
+            if (
+                sensor_id in self._measurement_degraded
+                and completed >= MEASUREMENT_WINDOWS_TO_RECOVER
+            ):
+                # The run completed while the row was being restored.
+                self._reconcile_measurement(sensor_id, clear=True, streak=completed)
+
+        def lost() -> None:
+            self._measurement_reconciling.discard(sensor_id)
+
+        self._measurement_writer.submit(
+            write_clear if clear else write_restore,
+            label=(
+                f"measurement {'recovery' if clear else 'restore'} sensor={sensor_id}"
+            ),
+            report=True,
+            on_lost=lost,
+        )
+
+    def _measurement_cleared_on_disk(self, sensor_id: str, streak: int) -> None:
+        """The disk says recovered; clear memory unless the run was broken."""
+        if sensor_id not in self._measurement_degraded:
+            return
+        if (
+            self._measurement_valid_streak.get(sensor_id, 0)
+            < MEASUREMENT_WINDOWS_TO_RECOVER
+        ):
+            # A refused window arrived while the clear was written: the sensor
+            # is still degraded, and the disk is owed its row back.
+            self._measurement_disk_recovered.add(sensor_id)
+            self._reconcile_measurement(sensor_id, clear=False)
+            return
+        self._finish_measurement_recovery(sensor_id, streak)
+
+    async def _close_measurement_writer(
+        self, grace_s: float = MEASUREMENT_CLOSE_GRACE_S
+    ) -> None:
+        writer = self._measurement_writer
+        await writer.drain(grace_s)
+        await writer.close(grace_s=grace_s)
+        if writer.lost or writer.unknown or self._measurement_disk_recovered:
+            logger.warning(
+                "[shutdown] measurement state: %d writes lost, %d unknown, "
+                "%d sensors recovered on disk while still degraded",
+                writer.lost,
+                writer.unknown,
+                len(self._measurement_disk_recovered),
+            )
+
+    def _finish_measurement_recovery(self, sensor_id: str, streak: int) -> None:
         self._measurement_degraded.discard(sensor_id)
         self._measurement_unnotified.discard(sensor_id)
         self._measurement_notify_attempts.pop(sensor_id, None)
@@ -4418,6 +4543,7 @@ class OriRuntime:
         # Any refusal breaks a recovery run. Alternating windows are not a
         # measurement path coming back.
         self._measurement_valid_streak.pop(sensor_id, None)
+        self._reconcile_measurement(sensor_id, clear=False)
         self._measurement_refusal_reason[sensor_id] = detail
         refusals = self._measurement_refusals.get(sensor_id, 0) + 1
         self._measurement_refusals[sensor_id] = refusals
@@ -4487,21 +4613,6 @@ class OriRuntime:
                 "the alert still fires, but a restart may repeat it",
                 sensor_id,
             )
-
-    async def _clear_measurement_state(self, sensor_id: str) -> bool:
-        """Record recovery durably. Returns False when it could not be written."""
-        if self._state_store is None:
-            return True
-        try:
-            await self._state_store.clear_measurement_degraded(sensor_id)
-        except Exception:
-            logger.exception(
-                "[sensor] could not persist measurement recovery for %s; "
-                "leaving it degraded rather than diverging from disk",
-                sensor_id,
-            )
-            return False
-        return True
 
     async def _emit_measurement_degraded_warning(
         self, *, sensor_id: str, refusals: int
