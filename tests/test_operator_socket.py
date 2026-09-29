@@ -73,7 +73,9 @@ class Recorder:
     def __init__(self, answer: Any = None) -> None:
         self.calls: list[tuple[ReconcileRequest, PeerCredentials, str | None]] = []
         self.answer: Any = (
-            answer if answer is not None else {"ok": True, "record": RECORD}
+            answer
+            if answer is not None
+            else {"ok": True, "record": RECORD, "already_recorded": False}
         )
 
     async def __call__(
@@ -85,10 +87,27 @@ class Recorder:
         if callable(self.answer):
             return await cast(Awaitable[Any], self.answer())
         return (
-            {**self.answer, "record": {**RECORD, "principal_uid": peer.uid}}
+            {**self.answer, "record": self._record(request, peer)}
             if self.answer.get("ok")
             else self.answer
         )
+
+    @staticmethod
+    def _record(request: ReconcileRequest, peer: PeerCredentials) -> dict[str, Any]:
+        """What the store appends for *request*: its outcome, reason and note."""
+        return {
+            **RECORD,
+            "decision_state": "reconciled_executed"
+            if request.outcome == "executed"
+            else "reconciled_not_executed",
+            "reason": request.reason,
+            "note": request.note,
+            "principal_uid": peer.uid,
+        }
+
+
+async def _no_commission(*_args: Any) -> Any:
+    raise AssertionError("a reconciliation request reached the commission handler")
 
 
 @contextlib.asynccontextmanager
@@ -96,6 +115,7 @@ async def serving(
     directory: Path, recorder: Recorder, **kwargs: Any
 ) -> AsyncIterator[OperatorSocketServer]:
     kwargs.setdefault("operator_uid", os.geteuid)
+    kwargs.setdefault("commission", _no_commission)
     kwargs.setdefault("grant", lambda _d, _s, _u: None)
     server = OperatorSocketServer(
         directory=directory / "run", reconcile=recorder, **kwargs
@@ -313,6 +333,10 @@ HOSTILE: list[tuple[str, bytes]] = [
     ("an array", b"[1,2]\n"),
     ("a string", b'"reconcile_tier_c"\n'),
     ("nesting past the recursion limit", b"[" * 4000 + b"]" * 4000 + b"\n"),
+    (
+        "an integer past the digit limit",
+        request()[:-2] + b', "n": ' + b"9" * 5000 + b"}\n",
+    ),
     ("invalid utf-8", b'{"operation":"\xff"}\n'),
     ("a NUL in the note", request(note="a\x00b")),
     (
@@ -455,11 +479,12 @@ async def test_an_append_begun_completes_when_the_socket_closes(
         started.set()
         await release.wait()
         finished.append(True)
-        return {"ok": True, "record": RECORD}
+        return {"ok": True, "record": RECORD, "already_recorded": False}
 
     server = OperatorSocketServer(
         directory=short_dir / "run",
         reconcile=Recorder(slow),
+        commission=_no_commission,
         operator_uid=os.geteuid,
         grant=lambda _d, _s, _u: None,
     )
@@ -529,6 +554,7 @@ async def test_a_held_append_lands_before_the_store_closes(
     server = OperatorSocketServer(
         directory=short_dir / "run",
         reconcile=reconcile,
+        commission=_no_commission,
         operator_uid=os.geteuid,
         grant=lambda _d, _s, _u: None,
     )
@@ -564,6 +590,7 @@ async def test_the_socket_and_directory_grant_no_group_or_world_access(
     server = OperatorSocketServer(
         directory=short_dir / "run",
         reconcile=Recorder(),
+        commission=_no_commission,
         operator_uid=lambda: None,
     )
     await server.start()
@@ -582,6 +609,7 @@ async def test_a_grant_that_fails_leaves_no_socket(short_dir: Path) -> None:
     server = OperatorSocketServer(
         directory=short_dir / "run",
         reconcile=Recorder(),
+        commission=_no_commission,
         operator_uid=lambda: 1001,
         grant=refuse,
     )
@@ -597,7 +625,10 @@ async def test_an_operator_identity_without_access_control_lists_binds_nothing(
     short_dir: Path,
 ) -> None:
     server = OperatorSocketServer(
-        directory=short_dir / "run", reconcile=Recorder(), operator_uid=lambda: 1001
+        directory=short_dir / "run",
+        reconcile=Recorder(),
+        commission=_no_commission,
+        operator_uid=lambda: 1001,
     )
     with pytest.raises(AccessGrantError):
         await server.start()
@@ -609,6 +640,7 @@ async def test_a_live_listener_is_never_displaced(short_dir: Path) -> None:
         second = OperatorSocketServer(
             directory=short_dir / "run",
             reconcile=Recorder(),
+            commission=_no_commission,
             operator_uid=lambda: None,
             grant=lambda _d, _s, _u: None,
         )
@@ -633,6 +665,7 @@ async def test_a_stale_socket_is_replaced_and_a_file_is_refused(
     server = OperatorSocketServer(
         directory=run,
         reconcile=Recorder(),
+        commission=_no_commission,
         operator_uid=lambda: None,
         grant=lambda _d, _s, _u: None,
     )
@@ -743,7 +776,10 @@ async def test_a_runtime_directory_another_user_owns_is_refused(
     run.mkdir(mode=0o700)
     os.chown(run, 12345, 12345)
     server = OperatorSocketServer(
-        directory=run, reconcile=Recorder(), operator_uid=lambda: None
+        directory=run,
+        reconcile=Recorder(),
+        commission=_no_commission,
+        operator_uid=lambda: None,
     )
     with pytest.raises(RuntimeError, match="this runtime owns"):
         await server.start()
@@ -995,6 +1031,330 @@ async def test_the_bridge_relays_an_internal_error_as_exit_one(
     assert (rc, payload["error"]["code"]) == (1, "internal_error")
     # A fault, not a refusal: it is outside the contract's closed exit-2 set.
     assert "internal_error" not in op.RECONCILE_ERRORS
+
+
+_RECONCILED = {
+    "proposal_id": "AB12CD34",
+    "device_id": "dev-1",
+    "zone_id": "zone-a",
+    "decision_state": "reconciled_executed",
+    "reason": "site_inspection",
+    "note": None,
+    "operator": {"uid": 0, "account": "root", "login_uid": None},
+    "entry_point": "local_operator_socket",
+    "recorded_at_ms": 1,
+    "already_recorded": False,
+}
+
+
+_FEEDBACK_RECORD = {
+    **_RECONCILED,
+    "reason": "actuator_position_observed",
+    "operator": {"uid": None, "account": None, "login_uid": None},
+    "entry_point": "commissioned_feedback",
+    "already_recorded": True,
+}
+_NO_OPERATOR = {"uid": None, "account": None, "login_uid": None}
+_UNBOUND_RECONCILED: list[tuple[str, dict[str, Any]]] = [
+    ("a lie", {"lie": True}),
+    ("another proposal", {**_RECONCILED, "proposal_id": "ZZ99ZZ99"}),
+    ("another device", {**_RECONCILED, "device_id": "dev-2"}),
+    ("another zone", {**_RECONCILED, "zone_id": "zone-b"}),
+    ("an extra field", {**_RECONCILED, "extra": 1}),
+    (
+        "a missing field",
+        {k: v for k, v in _RECONCILED.items() if k != "recorded_at_ms"},
+    ),
+    ("another outcome", {**_RECONCILED, "decision_state": "reconciled_not_executed"}),
+    ("an unreconciled state", {**_RECONCILED, "decision_state": "dispatch_not_proven"}),
+    ("another reason", {**_RECONCILED, "reason": "instrument_measurement"}),
+    ("another note", {**_RECONCILED, "note": "seen"}),
+    ("an operator that is not an object", {**_RECONCILED, "operator": 0}),
+    (
+        "an operator with an extra member",
+        {**_RECONCILED, "operator": {**_RECONCILED["operator"], "pid": 1}},
+    ),
+    (
+        "an operator uid as text",
+        {**_RECONCILED, "operator": {**_RECONCILED["operator"], "uid": "0"}},
+    ),
+    (
+        "an operator uid as a boolean",
+        {**_RECONCILED, "operator": {**_RECONCILED["operator"], "uid": False}},
+    ),
+    (
+        "a negative operator uid",
+        {**_RECONCILED, "operator": {**_RECONCILED["operator"], "uid": -1}},
+    ),
+    ("a socket record with no operator", {**_RECONCILED, "operator": _NO_OPERATOR}),
+    (
+        "an operator account that is not text",
+        {**_RECONCILED, "operator": {**_RECONCILED["operator"], "account": 0}},
+    ),
+    (
+        "an operator login uid as text",
+        {**_RECONCILED, "operator": {**_RECONCILED["operator"], "login_uid": "1"}},
+    ),
+    ("another entry point", {**_RECONCILED, "entry_point": "cli_bridge"}),
+    (
+        "a new record from feedback",
+        {**_FEEDBACK_RECORD, "already_recorded": False},
+    ),
+    (
+        "a feedback record with an operator",
+        {**_FEEDBACK_RECORD, "operator": _RECONCILED["operator"]},
+    ),
+    ("a negative time", {**_RECONCILED, "recorded_at_ms": -1}),
+    ("a time as a float", {**_RECONCILED, "recorded_at_ms": 1.0}),
+    ("a time as a boolean", {**_RECONCILED, "recorded_at_ms": True}),
+    ("already_recorded as an integer", {**_RECONCILED, "already_recorded": 0}),
+]
+
+
+async def _relay_through_fake_peer(
+    short_dir: Path, monkeypatch: Any, envelope: Any, argv: list[str]
+) -> tuple[int, dict[str, Any]]:
+    """The real bridge, against a verified peer that answers *envelope*."""
+    path = short_dir / "fake.sock"
+
+    async def answer(reader: Any, writer: Any) -> None:
+        await reader.readline()
+        writer.write(json.dumps(envelope).encode() + b"\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_unix_server(answer, path=str(path))
+    monkeypatch.setattr(cli_bridge, "_operator_install", lambda: (path, os.geteuid()))
+    try:
+        return await asyncio.to_thread(cli_bridge.run_bridge, argv)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.parametrize(
+    "result,argv",
+    [
+        (_RECONCILED, _bridge_argv()),
+        ({**_RECONCILED, "already_recorded": True}, _bridge_argv()),
+        (
+            {**_RECONCILED, "decision_state": "reconciled_not_executed", "note": "x"},
+            _bridge_argv(**{"--outcome": "not-executed", "--note": "x"}),
+        ),
+        (
+            _FEEDBACK_RECORD,
+            _bridge_argv(**{"--reason": "actuator_position_observed"}),
+        ),
+    ],
+    ids=["bound", "already recorded", "not executed with a note", "feedback repeat"],
+)
+async def test_a_reconcile_success_bound_to_this_request_is_relayed(
+    short_dir: Path, monkeypatch: Any, result: dict[str, Any], argv: list[str]
+) -> None:
+    rc, payload = await _relay_through_fake_peer(
+        short_dir,
+        monkeypatch,
+        {"schema_version": 1, "ok": True, "result": result},
+        argv,
+    )
+    assert (rc, payload["ok"], payload["result"]) == (0, True, result), payload
+
+
+@pytest.mark.parametrize(
+    "result",
+    [row for _, row in _UNBOUND_RECONCILED],
+    ids=[name for name, _ in _UNBOUND_RECONCILED],
+)
+async def test_a_reconcile_success_is_relayed_only_for_this_request(
+    short_dir: Path, monkeypatch: Any, result: dict[str, Any]
+) -> None:
+    argv = _bridge_argv(
+        **(
+            {"--reason": "actuator_position_observed"}
+            if result.get("entry_point") == "commissioned_feedback"
+            else {}
+        )
+    )
+    rc, payload = await _relay_through_fake_peer(
+        short_dir,
+        monkeypatch,
+        {"schema_version": 1, "ok": True, "result": result},
+        argv,
+    )
+    assert payload["ok"] is False and "result" not in payload, payload
+    assert (rc, payload["error"]["code"]) == (1, "internal_error")
+
+
+def _reconcile_request(argv: list[str]) -> dict[str, Any]:
+    request, _socket = cli_bridge._reconcile_arguments(argv[2:])
+    return request
+
+
+@pytest.mark.parametrize(
+    "result",
+    [row for _, row in _UNBOUND_RECONCILED],
+    ids=[name for name, _ in _UNBOUND_RECONCILED],
+)
+def test_the_reconcile_bound_refuses_without_raising(result: dict[str, Any]) -> None:
+    """Every unbound row is a refusal of the bound itself, never a crash past it."""
+    reason = (
+        {"--reason": "actuator_position_observed"}
+        if result.get("entry_point") == "commissioned_feedback"
+        else {}
+    )
+    assert (
+        cli_bridge._reconcile_bound(_reconcile_request(_bridge_argv(**reason)))(result)
+        is False
+    )
+
+
+async def test_a_reconcile_success_for_a_device_id_no_runtime_has_is_not_relayed(
+    short_dir: Path, monkeypatch: Any
+) -> None:
+    """Echoing a device ID the bridge accepted is not enough: it must be one."""
+    result = {**_RECONCILED, "device_id": "dev 1"}
+    argv = _bridge_argv(**{"--device-id": "dev 1"})
+    assert cli_bridge._reconcile_bound(_reconcile_request(argv))(result) is False
+    rc, payload = await _relay_through_fake_peer(
+        short_dir,
+        monkeypatch,
+        {"schema_version": 1, "ok": True, "result": result},
+        argv,
+    )
+    assert (rc, payload["error"]["code"]) == (1, "internal_error"), payload
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        {"schema_version": 1, "ok": True, "result": _RECONCILED, "extra": 1},
+        {"ok": True, "result": _RECONCILED},
+        {"schema_version": 2, "ok": True, "result": _RECONCILED},
+        {"schema_version": True, "ok": True, "result": _RECONCILED},
+        {"schema_version": "1", "ok": True, "result": _RECONCILED},
+        {"schema_version": 1, "ok": True, "result": [_RECONCILED]},
+        {"schema_version": 1, "ok": True},
+    ],
+    ids=[
+        "an extra member",
+        "no schema version",
+        "another schema version",
+        "a boolean schema version",
+        "a text schema version",
+        "a result that is not an object",
+        "no result",
+    ],
+)
+async def test_a_success_envelope_the_runtime_does_not_send_is_not_relayed(
+    short_dir: Path, monkeypatch: Any, envelope: dict[str, Any]
+) -> None:
+    rc, payload = await _relay_through_fake_peer(
+        short_dir, monkeypatch, envelope, _bridge_argv()
+    )
+    assert payload["ok"] is False and "result" not in payload, payload
+    assert (rc, payload["error"]["code"]) == (1, "internal_error")
+
+
+async def _returning(answer: Any) -> Any:
+    return answer
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"ok": True, "record": RECORD},
+        {"ok": True, "record": RECORD, "already_recorded": 0},
+        {"ok": True, "record": RECORD, "already_recorded": False, "extra": 1},
+        {"ok": 1, "record": RECORD, "already_recorded": False},
+        {
+            "ok": True,
+            "record": {**RECORD, "principal_uid": "0"},
+            "already_recorded": False,
+        },
+        {
+            "ok": True,
+            "record": {**RECORD, "principal_uid": None},
+            "already_recorded": False,
+        },
+        {
+            "ok": True,
+            "record": {**RECORD, "reason": "trust_me"},
+            "already_recorded": False,
+        },
+        {"ok": True, "record": {**RECORD, "note": "x"}, "already_recorded": False},
+        {
+            "ok": True,
+            "record": {**RECORD, "zone_id": "zone-b"},
+            "already_recorded": False,
+        },
+        {
+            "ok": True,
+            "record": {**RECORD, "decision_state": "dispatch_not_proven"},
+            "already_recorded": False,
+        },
+        {
+            "ok": True,
+            "record": {**RECORD, "entry_point": "x"},
+            "already_recorded": False,
+        },
+        {
+            "ok": True,
+            "record": {**RECORD, "recorded_at_ms": "1"},
+            "already_recorded": False,
+        },
+        {"ok": False, "error": 7},
+        {"ok": False, "error": "device_mismatch", "detail": "x"},
+        {"ok": 0, "error": "device_mismatch"},
+    ],
+    ids=[
+        "no already_recorded",
+        "already_recorded as an integer",
+        "an extra member",
+        "ok as an integer",
+        "a principal uid as text",
+        "a socket record with no principal",
+        "another reason",
+        "another note",
+        "another zone",
+        "an unreconciled state",
+        "another entry point",
+        "a time as text",
+        "a refusal code that is not text",
+        "a refusal with an extra member",
+        "a refusal with ok as an integer",
+    ],
+)
+async def test_the_socket_never_normalises_a_malformed_reconcile_answer(
+    short_dir: Path, answer: dict[str, Any]
+) -> None:
+    """The server's own answer is `internal_error`, never a coerced success."""
+    recorder = Recorder(lambda: _returning(answer))
+    async with serving(short_dir, recorder) as server:
+        reply = await send(server.path, request())
+    assert reply["ok"] is False and "result" not in reply, reply
+    assert reply["error"]["code"] == "internal_error", reply
+
+
+async def test_the_socket_answers_a_feedback_record_repeat(short_dir: Path) -> None:
+    """The positive control: the earlier record, written by feedback, is answered."""
+    record = {
+        **RECORD,
+        "reason": "actuator_position_observed",
+        "principal_uid": None,
+        "principal_account": None,
+        "entry_point": "commissioned_feedback",
+    }
+    answer = {"ok": True, "record": record, "already_recorded": True}
+    recorder = Recorder(lambda: _returning(answer))
+    async with serving(short_dir, recorder) as server:
+        reply = await send(server.path, request(reason="actuator_position_observed"))
+    assert reply["ok"] is True, reply
+    assert reply["result"]["operator"] == {
+        "uid": None,
+        "account": None,
+        "login_uid": None,
+    }
+    assert reply["result"]["entry_point"] == "commissioned_feedback"
 
 
 def test_the_bridge_derives_the_user_scope_identity(
