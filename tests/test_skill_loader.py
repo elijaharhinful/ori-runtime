@@ -14,6 +14,8 @@ import yaml
 from ori.network.event_bus import EventBus
 from ori.network.events import OriEvent, SensorReading
 from ori.skills.loader import (
+    _ACTION_ALLOWED_KEYS,
+    _TRIGGER_ALLOWED_KEYS,
     Skill,
     SkillLoader,
     SkillValidationError,
@@ -1987,20 +1989,109 @@ def test_every_bundled_skill_loads(manifest: Path) -> None:
     for trigger in skill.triggers:
         assert isinstance(trigger.requires_approval, bool)
 
-    def test_rejects_unknown_keys_in_trigger(self, tmp_path):
-        skill_dir = tmp_path / "s"
-        _write_skill_yaml(
-            skill_dir,
-            _minimal_yaml() + "            unknown_key: true\n",
-        )
-        loader = _first_party_loader()
-        with pytest.raises(SkillValidationError, match="unrecognized key.*unknown_key"):
-            loader.load_one(skill_dir)
 
-    def test_rejects_unknown_keys_in_action(self, tmp_path):
-        skill_dir = tmp_path / "s"
-        yaml = _minimal_yaml().replace("tier: A", "tier: A\n              unknown_action_key: false")
-        _write_skill_yaml(skill_dir, yaml)
-        loader = _first_party_loader()
-        with pytest.raises(SkillValidationError, match="unrecognized key.*unknown_action_key"):
-            loader.load_one(skill_dir)
+# ---------------------------------------------------------------------------
+# Unknown-key rejection tests (Issue #709)
+# ---------------------------------------------------------------------------
+# These tests are built from the loader's own allowed-key sets so that if a
+# new key is ever added to the grammar, the tests adapt automatically rather
+# than silently becoming stale.
+
+
+def _a_key_outside(allowed: frozenset[str]) -> str:
+    """Return a key string that is definitely not in *allowed*."""
+    candidate = "unknown_key"
+    while candidate in allowed:
+        candidate = "_" + candidate
+    return candidate
+
+
+# -- Trigger unknown-key tests -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        _a_key_outside(_TRIGGER_ALLOWED_KEYS),
+        "Requires_Approval",  # capital-R typo from the issue
+        "requiresApproval",  # camelCase typo from the issue
+    ],
+)
+def test_rejects_unknown_keys_in_trigger(tmp_path: Path, bad_key: str) -> None:
+    """Loader must refuse any key not in _TRIGGER_ALLOWED_KEYS."""
+    skill_dir = tmp_path / "s"
+    # Inject the bad key inside the trigger block by appending after action_tier
+    yaml_text = _minimal_yaml().replace(
+        "            action_tier: A",
+        f"            action_tier: A\n            {bad_key}: true",
+    )
+    _write_skill_yaml(skill_dir, yaml_text)
+    with pytest.raises(SkillValidationError, match="unrecognized key"):
+        _first_party_loader().load_one(skill_dir)
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        "Requires_Approval",
+        "requiresApproval",
+    ],
+)
+def test_rejects_unknown_trigger_key_through_load_all(
+    tmp_path: Path, bad_key: str
+) -> None:
+    """Unknown trigger keys must also surface when discovered via load_all."""
+    skill_dir = tmp_path / "bad-skill"
+    yaml_text = _minimal_yaml().replace(
+        "            action_tier: A",
+        f"            action_tier: A\n            {bad_key}: true",
+    )
+    _write_skill_yaml(skill_dir, yaml_text)
+    # load_all swallows SkillValidationError and skips the skill; the skill
+    # must not appear in the returned list.
+    skills = _first_party_loader().load_all(str(tmp_path))
+    assert not any(s.name == "test-skill" for s in skills)
+
+
+# -- Action unknown-key tests ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        _a_key_outside(_ACTION_ALLOWED_KEYS),
+        "Requires_Approval",
+        "requiresApproval",
+    ],
+)
+def test_rejects_unknown_keys_in_action(tmp_path: Path, bad_key: str) -> None:
+    """Loader must refuse any key not in _ACTION_ALLOWED_KEYS."""
+    skill_dir = tmp_path / "s"
+    yaml_text = _minimal_yaml().replace(
+        "- name: alert_whatsapp\n              tier: A",
+        f"- name: alert_whatsapp\n              tier: A\n              {bad_key}: false",
+    )
+    _write_skill_yaml(skill_dir, yaml_text)
+    with pytest.raises(SkillValidationError, match="unrecognized key"):
+        _first_party_loader().load_one(skill_dir)
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        "Requires_Approval",
+        "requiresApproval",
+    ],
+)
+def test_rejects_unknown_action_key_through_load_all(
+    tmp_path: Path, bad_key: str
+) -> None:
+    """Unknown action keys must also surface when discovered via load_all."""
+    skill_dir = tmp_path / "bad-skill"
+    yaml_text = _minimal_yaml().replace(
+        "- name: alert_whatsapp\n              tier: A",
+        f"- name: alert_whatsapp\n              tier: A\n              {bad_key}: false",
+    )
+    _write_skill_yaml(skill_dir, yaml_text)
+    skills = _first_party_loader().load_all(str(tmp_path))
+    assert not any(s.name == "test-skill" for s in skills)

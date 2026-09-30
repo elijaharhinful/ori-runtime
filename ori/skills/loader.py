@@ -61,23 +61,27 @@ from ori.utils.path_utils import shown
 
 logger = logging.getLogger(__name__)
 
-_TRIGGER_ALLOWED_KEYS = frozenset({
-    "name",
-    "condition",
-    "action_tier",
-    "cooldown_seconds",
-    "escalate_to",
-    "bypass_llm",
-    "requires_approval",
-    "reasoning_policy",
-    "approval_timeout_seconds",
-    "safe_default_action",
-})
+_TRIGGER_ALLOWED_KEYS = frozenset(
+    {
+        "name",
+        "condition",
+        "action_tier",
+        "cooldown_seconds",
+        "escalate_to",
+        "bypass_llm",
+        "requires_approval",
+        "reasoning_policy",
+        "approval_timeout_seconds",
+        "safe_default_action",
+    }
+)
 
-_ACTION_ALLOWED_KEYS = frozenset({
-    "name",
-    "tier",
-})
+_ACTION_ALLOWED_KEYS = frozenset(
+    {
+        "name",
+        "tier",
+    }
+)
 
 _VALID_TIERS = frozenset({"A", "B", "C", "D"})
 
@@ -1613,7 +1617,7 @@ class SkillLoader:
         for entry in available:
             if not isinstance(entry, dict):
                 continue
-            
+
             action_name = entry.get("name")
             if "requires_approval" in entry:
                 raise SkillValidationError(
@@ -1631,7 +1635,7 @@ class SkillLoader:
                     f"unrecognized key(s) which the runtime does not read: "
                     f"{', '.join(sorted(unknown_keys))}"
                 )
-                
+
             declared = str(entry.get("tier") or "").upper()
             if not isinstance(action_name, str):
                 continue
