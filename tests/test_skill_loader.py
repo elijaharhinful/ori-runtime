@@ -1986,3 +1986,21 @@ def test_every_bundled_skill_loads(manifest: Path) -> None:
     assert skill.first_party
     for trigger in skill.triggers:
         assert isinstance(trigger.requires_approval, bool)
+
+    def test_rejects_unknown_keys_in_trigger(self, tmp_path):
+        skill_dir = tmp_path / "s"
+        _write_skill_yaml(
+            skill_dir,
+            _minimal_yaml() + "            unknown_key: true\n",
+        )
+        loader = _first_party_loader()
+        with pytest.raises(SkillValidationError, match="unrecognized key.*unknown_key"):
+            loader.load_one(skill_dir)
+
+    def test_rejects_unknown_keys_in_action(self, tmp_path):
+        skill_dir = tmp_path / "s"
+        yaml = _minimal_yaml().replace("tier: A", "tier: A\n              unknown_action_key: false")
+        _write_skill_yaml(skill_dir, yaml)
+        loader = _first_party_loader()
+        with pytest.raises(SkillValidationError, match="unrecognized key.*unknown_action_key"):
+            loader.load_one(skill_dir)
