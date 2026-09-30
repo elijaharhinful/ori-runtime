@@ -28,6 +28,7 @@ from ori.security.evidence.authority_keys import (
     STATUS_REVOKED,
     STATUS_VERIFY_ONLY,
     AuthorityKeyError,
+    derive_key_id,
     load_authority_key_registry,
     select_verifying_key,
 )
@@ -96,35 +97,80 @@ def public_hex(seed_hex: str) -> str:
 
 @pytest.fixture
 def registry(tmp_path):
-    """A release-shipped registry holding both authority purposes."""
-    receipt_seed = vector("delivery-receipt")["authority_receipt_seed_hex"]
-    epoch_seed = vector("epoch-confirmation")["signing_key_seed_hex"]
+    """The registry each authority-artifact corpus embeds, loaded through the conforming loader."""
+    embedded = vector("delivery-receipt-v2")["authority_key_registry"]
+    assert vector("epoch-confirmation-v2")["authority_key_registry"] == embedded
     path = tmp_path / "authority-keys.json"
-    path.write_text(
-        json.dumps(
-            {
-                "schema": REGISTRY_SCHEMA,
-                "keys": [
-                    {
-                        "key_id": case("delivery-receipt", "valid")["artifact"][
-                            "key_id"
-                        ],
-                        "public_key_hex": public_hex(receipt_seed),
-                        "purpose": PURPOSE_RECEIPT,
-                        "status": "active",
-                    },
-                    {
-                        "key_id": case("epoch-confirmation", "valid")["artifact"][
-                            "key_id"
-                        ],
-                        "public_key_hex": public_hex(epoch_seed),
-                        "purpose": PURPOSE_EPOCH,
-                        "status": "active",
-                    },
-                ],
-            }
+    path.write_text(json.dumps(embedded))
+    return load_authority_key_registry(path)
+
+
+def test_the_embedded_registry_holds_the_keys_the_corpora_sign_under(registry):
+    """Selection by (purpose, key_id) lands on the key each corpus names as its signer."""
+    for name, purpose in (
+        ("delivery-receipt-v2", PURPOSE_RECEIPT),
+        ("epoch-confirmation-v2", PURPOSE_EPOCH),
+    ):
+        published = vector(name)
+        selected = select_verifying_key(registry, purpose, published["key_id"])
+        assert selected.public_key_hex == published["signing_key_public_hex"]
+        assert selected.public_key_hex == public_hex(published["signing_key_seed_hex"])
+        assert (
+            derive_key_id(bytes.fromhex(selected.public_key_hex)) == published["key_id"]
         )
+
+
+def _replay_context(name: str, artifact: dict) -> dict:
+    """The receiver state under which the corpus's valid case is accepted."""
+    if name == "delivery-receipt-v2":
+        valid = case(name, "valid")["artifact"]
+        return {
+            "envelope_digests": _digests_for(
+                valid["from_seq"], valid["to_seq"], valid["range_digest"]
+            )
+        }
+    return {"expected_pubkey_hex": case(name, "valid")["artifact"]["pubkey_hex"]}
+
+
+@pytest.mark.parametrize(
+    "name,case_name",
+    [
+        (name, c["name"])
+        for name in ("delivery-receipt-v2", "epoch-confirmation-v2")
+        for c in json.loads((VECTORS / f"{name}.json").read_text())["cases"]
+    ],
+)
+def test_every_authority_artifact_case_replays_end_to_end(registry, name, case_name):
+    """Loaded registry, selection by (purpose, key_id), verification, outcome as published."""
+    published = case(name, case_name)
+    artifact = published["artifact"]
+    verify = (
+        verify_delivery_receipt
+        if name == "delivery-receipt-v2"
+        else verify_epoch_confirmation
     )
+    context = _replay_context(name, artifact)
+    if published["expected"] == "accept":
+        verify(artifact, device_id=DEVICE, registry=registry, **context)
+        return
+    assert published["expected"] == "reject"
+    with pytest.raises(IngestRejectedError):
+        verify(artifact, device_id=DEVICE, registry=registry, **context)
+
+
+def _key_entry(status: str = "active") -> dict[str, str]:
+    raw = Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+    return {
+        "key_id": derive_key_id(raw),
+        "public_key_hex": raw.hex(),
+        "purpose": PURPOSE_RECEIPT,
+        "status": status,
+    }
+
+
+def _loaded(tmp_path, *entries: dict[str, str]) -> dict:
+    path = tmp_path / "keys.json"
+    path.write_text(json.dumps({"schema": REGISTRY_SCHEMA, "keys": list(entries)}))
     return load_authority_key_registry(path)
 
 
@@ -139,7 +185,7 @@ def test_a_key_held_for_another_purpose_does_not_verify(registry):
     "Unknown" and "held for something else" are different findings: one is a
     missing key, the other is the shape of a cross-purpose substitution.
     """
-    receipt_key_id = case("delivery-receipt", "valid")["artifact"]["key_id"]
+    receipt_key_id = case("delivery-receipt-v2", "valid")["artifact"]["key_id"]
     with pytest.raises(AuthorityKeyError, match="is held for"):
         select_verifying_key(registry, PURPOSE_EPOCH, receipt_key_id)
 
@@ -149,51 +195,19 @@ def test_an_unknown_key_is_distinguished_from_a_misplaced_one(registry):
         select_verifying_key(registry, PURPOSE_RECEIPT, "never-issued")
 
 
-@pytest.mark.parametrize("status", [STATUS_REVOKED])
-def test_a_revoked_key_verifies_nothing(tmp_path, status):
+def test_a_revoked_key_verifies_nothing(tmp_path):
     """A retired key that still verified would make rotation cosmetic."""
-    path = tmp_path / "keys.json"
-    path.write_text(
-        json.dumps(
-            {
-                "schema": REGISTRY_SCHEMA,
-                "keys": [
-                    {
-                        "key_id": "old",
-                        "public_key_hex": "aa" * 32,
-                        "purpose": PURPOSE_RECEIPT,
-                        "status": status,
-                    }
-                ],
-            }
-        )
-    )
-    loaded = load_authority_key_registry(path)
+    revoked = _key_entry(STATUS_REVOKED)
+    loaded = _loaded(tmp_path, _key_entry(), revoked)
     with pytest.raises(AuthorityKeyError, match="verifies nothing"):
-        select_verifying_key(loaded, PURPOSE_RECEIPT, "old")
+        select_verifying_key(loaded, PURPOSE_RECEIPT, revoked["key_id"])
 
 
 def test_a_verify_only_key_still_verifies(tmp_path):
     """Rotation keeps artifacts signed before it verifiable."""
-    path = tmp_path / "keys.json"
-    path.write_text(
-        json.dumps(
-            {
-                "schema": REGISTRY_SCHEMA,
-                "keys": [
-                    {
-                        "key_id": "outgoing",
-                        "public_key_hex": "bb" * 32,
-                        "purpose": PURPOSE_RECEIPT,
-                        "status": STATUS_VERIFY_ONLY,
-                    }
-                ],
-            }
-        )
-    )
-    assert select_verifying_key(
-        load_authority_key_registry(path), PURPOSE_RECEIPT, "outgoing"
-    )
+    outgoing = _key_entry(STATUS_VERIFY_ONLY)
+    loaded = _loaded(tmp_path, _key_entry(), outgoing)
+    assert select_verifying_key(loaded, PURPOSE_RECEIPT, outgoing["key_id"])
 
 
 @pytest.mark.parametrize(
@@ -206,22 +220,12 @@ def test_a_verify_only_key_still_verifies(tmp_path):
             "does not govern",
         ),
         (lambda r: r["keys"][0].__setitem__("status", "probationary"), "status"),
-        (lambda r: r["keys"][0].__setitem__("public_key_hex", "aa"), "32"),
+        (lambda r: r["keys"][0].__setitem__("public_key_hex", "aa"), "64 lowercase"),
         (lambda r: r.__setitem__("extra", True), "fields are wrong"),
     ],
 )
 def test_a_malformed_registry_is_refused(tmp_path, mutate, expected):
-    raw = {
-        "schema": REGISTRY_SCHEMA,
-        "keys": [
-            {
-                "key_id": "k1",
-                "public_key_hex": "cc" * 32,
-                "purpose": PURPOSE_RECEIPT,
-                "status": "active",
-            }
-        ],
-    }
+    raw = {"schema": REGISTRY_SCHEMA, "keys": [_key_entry()]}
     mutate(raw)
     path = tmp_path / "keys.json"
     path.write_text(json.dumps(raw))
@@ -260,7 +264,7 @@ def _digests_for(
 
 
 def test_the_valid_receipt_verifies(registry):
-    artifact = case("delivery-receipt", "valid")["artifact"]
+    artifact = case("delivery-receipt-v2", "valid")["artifact"]
     digests = _digests_for(
         artifact["from_seq"], artifact["to_seq"], artifact["range_digest"]
     )
@@ -282,9 +286,9 @@ def test_a_receipt_signed_with_the_epoch_key_is_refused(registry):
     is a signature failure; a verifier that trial-verified against every key it
     holds would accept this.
     """
-    artifact = case("delivery-receipt", "signed_with_epoch_key")["artifact"]
+    artifact = case("delivery-receipt-v2", "signed_with_epoch_key")["artifact"]
     assert (
-        artifact["key_id"] == case("delivery-receipt", "valid")["artifact"]["key_id"]
+        artifact["key_id"] == case("delivery-receipt-v2", "valid")["artifact"]["key_id"]
     ), "this case is only meaningful while it names the correct key id"
     with pytest.raises(IngestRejectedError) as raised:
         verify_delivery_receipt(
@@ -294,7 +298,7 @@ def test_a_receipt_signed_with_the_epoch_key_is_refused(registry):
 
 
 def test_a_non_contiguous_receipt_is_refused(registry):
-    artifact = case("delivery-receipt", "non_contiguous_range")["artifact"]
+    artifact = case("delivery-receipt-v2", "non_contiguous_range")["artifact"]
     with pytest.raises(IngestRejectedError) as raised:
         verify_delivery_receipt(
             artifact, device_id=DEVICE, registry=registry, envelope_digests={}
@@ -303,7 +307,7 @@ def test_a_non_contiguous_receipt_is_refused(registry):
 
 
 def test_a_receipt_for_another_device_is_refused(registry):
-    artifact = dict(case("delivery-receipt", "valid")["artifact"])
+    artifact = dict(case("delivery-receipt-v2", "valid")["artifact"])
     with pytest.raises(IngestRejectedError) as raised:
         verify_delivery_receipt(
             artifact,
@@ -318,7 +322,7 @@ def test_a_receipt_for_another_device_is_refused(registry):
 
 def test_a_receipt_covering_unsealed_sequences_is_refused(registry):
     """A receipt cannot assert a range this device never produced."""
-    artifact = case("delivery-receipt", "valid")["artifact"]
+    artifact = case("delivery-receipt-v2", "valid")["artifact"]
     with pytest.raises(IngestRejectedError) as raised:
         verify_delivery_receipt(
             artifact, device_id=DEVICE, registry=registry, envelope_digests={}
@@ -328,7 +332,7 @@ def test_a_receipt_covering_unsealed_sequences_is_refused(registry):
 
 def test_a_receipt_whose_range_digest_disagrees_is_refused(registry):
     """Recomputing the digest is what makes the prefix claim checkable."""
-    artifact = dict(case("delivery-receipt", "valid")["artifact"])
+    artifact = dict(case("delivery-receipt-v2", "valid")["artifact"])
     digests = _digests_for(
         artifact["from_seq"], artifact["to_seq"], artifact["range_digest"]
     )
@@ -346,7 +350,7 @@ def test_a_receipt_whose_range_digest_disagrees_is_refused(registry):
 
 
 def test_the_valid_epoch_confirmation_verifies(registry):
-    artifact = case("epoch-confirmation", "valid")["artifact"]
+    artifact = case("epoch-confirmation-v2", "valid")["artifact"]
     verified = verify_epoch_confirmation(
         artifact,
         device_id=DEVICE,
@@ -358,9 +362,10 @@ def test_the_valid_epoch_confirmation_verifies(registry):
 
 def test_a_confirmation_signed_with_the_receipt_key_is_refused(registry):
     """A receipt key cannot assert that an epoch became effective."""
-    artifact = case("epoch-confirmation", "signed_with_receipt_key")["artifact"]
+    artifact = case("epoch-confirmation-v2", "signed_with_receipt_key")["artifact"]
     assert (
-        artifact["key_id"] == case("epoch-confirmation", "valid")["artifact"]["key_id"]
+        artifact["key_id"]
+        == case("epoch-confirmation-v2", "valid")["artifact"]["key_id"]
     )
     with pytest.raises(IngestRejectedError) as raised:
         verify_epoch_confirmation(
@@ -377,8 +382,8 @@ def test_an_artifact_naming_a_key_held_for_another_purpose_is_refused(registry):
     both shapes need covering: one fails at the lookup, the other at the
     signature, and a verifier could easily catch one and not the other.
     """
-    artifact = dict(case("delivery-receipt", "valid")["artifact"])
-    artifact["key_id"] = case("epoch-confirmation", "valid")["artifact"]["key_id"]
+    artifact = dict(case("delivery-receipt-v2", "valid")["artifact"])
+    artifact["key_id"] = case("epoch-confirmation-v2", "valid")["artifact"]["key_id"]
     with pytest.raises(IngestRejectedError) as raised:
         verify_delivery_receipt(
             artifact, device_id=DEVICE, registry=registry, envelope_digests={}
@@ -388,7 +393,7 @@ def test_an_artifact_naming_a_key_held_for_another_purpose_is_refused(registry):
 
 def test_a_confirmation_naming_another_key_is_refused(registry):
     """Without this binding, a statement about another device's anchor would advance this one's."""
-    artifact = case("epoch-confirmation", "valid")["artifact"]
+    artifact = case("epoch-confirmation-v2", "valid")["artifact"]
     with pytest.raises(IngestRejectedError) as raised:
         verify_epoch_confirmation(
             artifact, device_id=DEVICE, registry=registry, expected_pubkey_hex="11" * 32
@@ -397,7 +402,7 @@ def test_a_confirmation_naming_another_key_is_refused(registry):
 
 
 def test_a_confirmation_for_another_device_is_refused(registry):
-    artifact = case("epoch-confirmation", "valid")["artifact"]
+    artifact = case("epoch-confirmation-v2", "valid")["artifact"]
     with pytest.raises(IngestRejectedError) as raised:
         verify_epoch_confirmation(
             artifact,
@@ -680,10 +685,10 @@ def test_a_tombstone_cannot_name_a_generation_that_still_holds_a_secret():
 @pytest.mark.parametrize(
     "verifier,name,kwargs",
     [
-        (verify_delivery_receipt, "delivery-receipt", {"envelope_digests": {}}),
+        (verify_delivery_receipt, "delivery-receipt-v2", {"envelope_digests": {}}),
         (
             verify_epoch_confirmation,
-            "epoch-confirmation",
+            "epoch-confirmation-v2",
             {"expected_pubkey_hex": "00" * 32},
         ),
     ],
@@ -705,18 +710,18 @@ def test_an_unrecognised_version_is_rejected_before_anything_is_trusted(
     assert raised.value.reason == REJECT_UNRECOGNISED_VERSION
 
 
-@pytest.mark.parametrize("name", ["delivery-receipt", "epoch-confirmation"])
+@pytest.mark.parametrize("name", ["delivery-receipt-v2", "epoch-confirmation-v2"])
 def test_an_undefined_field_is_rejected(registry, name):
     artifact = dict(case(name, "valid")["artifact"])
     artifact["unexpected"] = True
     kwargs = (
         {"envelope_digests": {}}
-        if name == "delivery-receipt"
+        if name == "delivery-receipt-v2"
         else {"expected_pubkey_hex": "00" * 32}
     )
     verifier = (
         verify_delivery_receipt
-        if name == "delivery-receipt"
+        if name == "delivery-receipt-v2"
         else verify_epoch_confirmation
     )
     with pytest.raises(IngestRejectedError):

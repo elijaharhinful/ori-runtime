@@ -177,13 +177,16 @@ REQUIRED_SCHEMA: dict[str, dict[str, set[str]]] = {
             "artifact",
         },
     },
-    "epoch-confirmation": {
+    "epoch-confirmation-v2": {
         "top": {
             "artifact",
             "domain_ascii",
             "key_purpose",
             "signing_key_seed_hex",
             "signing_key_public_hex",
+            "key_id",
+            "key_id_note",
+            "authority_key_registry",
             "cases",
         },
         "case": {
@@ -237,7 +240,7 @@ REQUIRED_SCHEMA: dict[str, dict[str, set[str]]] = {
             "artifact",
         },
     },
-    "delivery-receipt": {
+    "delivery-receipt-v2": {
         "top": {
             "artifact",
             "domain_ascii",
@@ -247,6 +250,9 @@ REQUIRED_SCHEMA: dict[str, dict[str, set[str]]] = {
             "authority_receipt_seed_hex",
             "epoch_authority_seed_hex",
             "rejection_integrity_note",
+            "key_id",
+            "key_id_note",
+            "authority_key_registry",
             "cases",
         },
         "case": {
@@ -324,7 +330,7 @@ def test_the_rejection_integrity_note_survives() -> None:
     has happened once already.
     """
     doc = json.loads(
-        (VECTORS / "evidence_exchange" / "delivery-receipt.json").read_text()
+        (VECTORS / "evidence_exchange" / "delivery-receipt-v2.json").read_text()
     )
     note = doc.get("rejection_integrity_note", "")
     assert "re-signs every case" in note, (
@@ -435,6 +441,14 @@ VECTOR_CONSUMERS = {
         "evidence/test_registration.py"
         "::test_the_registration_carries_exactly_the_contract_field_set",
     ),
+    ("evidence_exchange", "authority-key-registry-v2"): (
+        "evidence/test_authority_key_registry_vectors.py"
+        "::test_every_corpus_registry_is_decided_for_its_own_rule",
+        "evidence/test_authority_key_registry_vectors.py"
+        "::test_every_corpus_public_key_is_decided_for_its_own_clause",
+        "evidence/test_authority_key_registry_vectors.py"
+        "::test_every_corpus_selection_is_decided_by_purpose_and_key_id",
+    ),
     ("evidence_exchange", "checkpoint"): (
         "evidence/test_delivery_ledger.py"
         "::test_the_checkpoint_reproduces_the_contract_vector_byte_for_byte",
@@ -452,14 +466,18 @@ VECTOR_CONSUMERS = {
         "evidence/test_delivery_ledger.py"
         "::test_the_envelope_reproduces_the_contract_vector_byte_for_byte",
     ),
-    ("evidence_exchange", "delivery-receipt"): (
+    ("evidence_exchange", "delivery-receipt-v2"): (
         "evidence/test_ingest.py::test_the_valid_receipt_verifies",
         "evidence/test_ingest.py::test_a_receipt_signed_with_the_epoch_key_is_refused",
         "evidence/test_ingest.py::test_a_non_contiguous_receipt_is_refused",
+        "evidence/test_ingest.py::test_every_authority_artifact_case_replays_end_to_end",
+        "evidence/test_ingest.py"
+        "::test_the_embedded_registry_holds_the_keys_the_corpora_sign_under",
     ),
-    ("evidence_exchange", "epoch-confirmation"): (
+    ("evidence_exchange", "epoch-confirmation-v2"): (
         "evidence/test_ingest.py::test_the_valid_epoch_confirmation_verifies",
         "evidence/test_ingest.py::test_a_confirmation_signed_with_the_receipt_key_is_refused",
+        "evidence/test_ingest.py::test_every_authority_artifact_case_replays_end_to_end",
     ),
     ("evidence_exchange", "evidence-disposition-v2"): (
         "evidence/test_disposition_vectors.py::test_anchor_cases",
@@ -536,19 +554,6 @@ VECTOR_CONSUMERS = {
 #: tracked, because naming a repository says who is answerable rather than that
 #: the work is done.
 VECTOR_EXEMPTIONS = {
-    ("evidence_exchange", "authority-key-registry-v2"): {
-        "owner": "the runtime",
-        "status": "proof_pending",
-        "tracking": "ori-runtime#442",
-        "reason": (
-            "The release-shipped authority key registry. The runtime's registry "
-            "loader predates this corpus and accepts registries it refuses: an "
-            "underived or non-lowercase key_id, a non-canonical, off-curve or "
-            "small-order key, a key under two purposes, and zero or two active "
-            "keys for a purpose. Vendored so the drift check covers the bytes "
-            "the loader must meet when it is brought to the contract."
-        ),
-    },
     ("evidence_exchange", "routing-projection-v2"): {
         "owner": "the site gateway",
         "status": "proof_pending",

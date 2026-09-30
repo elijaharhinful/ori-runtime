@@ -63,6 +63,7 @@ from ori.runtime import (
     _warn_sms_webhook_security_posture,
     requires_production_posture,
 )
+from ori.security.evidence.authority_keys import ReleaseAuthorityKeys
 from ori.security.gateway_messages import (
     GatewayMessageAuthConfig,
     GatewayMessageAuthenticator,
@@ -5981,6 +5982,31 @@ async def _until_started(runtime: OriRuntime, timeout_s: float = 30.0) -> None:
         await asyncio.sleep(0.05)
 
 
+def _generated_registry(*purposes: str) -> dict:
+    """A contract-conforming registry of fresh keys, one active key per purpose."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from ori.security.evidence.authority_keys import (
+        derive_key_id,
+        parse_authority_key_registry,
+    )
+
+    keys = []
+    for purpose in purposes:
+        raw = Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+        keys.append(
+            {
+                "key_id": derive_key_id(raw),
+                "public_key_hex": raw.hex(),
+                "purpose": purpose,
+                "status": "active",
+            }
+        )
+    return parse_authority_key_registry(
+        {"schema": "ori.evidence_authority_keys.v1", "keys": keys}
+    )
+
+
 class TestEvidencePostureNeverGatesStartup:
     """Tier D is never gated on evidence, not by availability and not by trust.
 
@@ -6008,7 +6034,9 @@ class TestEvidencePostureNeverGatesStartup:
         config.evidence.key_path = str(tmp_path / "evidence.key")
         monkeypatch.setattr("ori.runtime.Config.load", lambda _path: config)
         # The release under test ships no authority-key registry.
-        monkeypatch.setattr("ori.runtime._load_authority_keys", lambda: {})
+        monkeypatch.setattr(
+            "ori.runtime._load_authority_keys", lambda: ReleaseAuthorityKeys(keys={})
+        )
         runtime = OriRuntime(config_path=str(minimal_config))
         observed: dict[str, Any] = {}
 
@@ -6032,8 +6060,75 @@ class TestEvidencePostureNeverGatesStartup:
         assert health["status"] == "degraded"
         assert health.get("critical") is not True
 
-    async def test_a_runtime_with_evidence_trust_reports_no_posture_problems(
+    async def test_a_refused_shipped_registry_does_not_stop_the_runtime(
         self, minimal_config, monkeypatch, tmp_path
+    ):
+        """A registry the release ships and the loader refuses stops evidence, not start."""
+        from importlib import resources
+
+        _patch_external(monkeypatch)
+        _treat_scratch_skills_as_packaged(monkeypatch)
+        monkeypatch.setenv("ORI_EVIDENCE_DEVICE_SECRET", "install-secret-for-test")
+        corpus = json.loads(
+            (
+                Path(__file__).parent
+                / "vectors"
+                / "evidence_exchange"
+                / "authority-key-registry-v2.json"
+            ).read_text(encoding="utf-8")
+        )
+        refused = next(
+            c for c in corpus["registries"] if c["name"] == "two_active_keys"
+        )
+        shipped = tmp_path / "package"
+        shipped.mkdir()
+        (shipped / "evidence-authority-keys.json").write_text(
+            json.dumps(refused["document"]), encoding="utf-8"
+        )
+        original_files = resources.files
+        monkeypatch.setattr(
+            resources,
+            "files",
+            lambda package: (
+                shipped if package == "ori.security" else original_files(package)
+            ),
+        )
+        config = Config.load(str(minimal_config))
+        config.device.deployment_profile = "production"
+        config.reasoning.default_tier = "rule"
+        config.reasoning.local_model = ""
+        config.reasoning.model_path = ""
+        config.evidence.enabled = True
+        config.evidence.db_path = str(tmp_path / "evidence.db")
+        config.evidence.key_path = str(tmp_path / "evidence.key")
+        monkeypatch.setattr("ori.runtime.Config.load", lambda _path: config)
+        runtime = OriRuntime(config_path=str(minimal_config))
+        observed: dict[str, Any] = {}
+
+        async def _observe_then_stop():
+            await _until_started(runtime)
+            observed["dispatcher"] = runtime._dispatcher
+            observed["health"] = await runtime._build_health_snapshot()
+            await runtime.stop()
+
+        await asyncio.gather(runtime.start(), _observe_then_stop())
+
+        assert observed["dispatcher"] is not None, "the action path did not come up"
+        health = observed["health"]
+        assert health["evidence"]["posture_problems"] == ["authority_keys_refused"]
+        assert health["status"] == "degraded"
+        assert health.get("critical") is not True
+
+    @pytest.mark.parametrize(
+        "purposes,expected",
+        [
+            (("evidence_authority_receipt", "evidence_authority_epoch"), []),
+            (("evidence_authority_receipt",), ["authority_keys_incomplete"]),
+            (("evidence_authority_epoch",), ["authority_keys_incomplete"]),
+        ],
+    )
+    async def test_evidence_trust_requires_every_purpose_the_release_verifies(
+        self, minimal_config, monkeypatch, tmp_path, purposes, expected
     ):
         _patch_external(monkeypatch)
         _treat_scratch_skills_as_packaged(monkeypatch)
@@ -6049,7 +6144,7 @@ class TestEvidencePostureNeverGatesStartup:
         monkeypatch.setattr("ori.runtime.Config.load", lambda _path: config)
         monkeypatch.setattr(
             "ori.runtime._load_authority_keys",
-            lambda: {("evidence_authority_receipt", "auth-receipt-1"): object()},
+            lambda: ReleaseAuthorityKeys(keys=_generated_registry(*purposes)),
         )
         runtime = OriRuntime(config_path=str(minimal_config))
         observed: dict[str, Any] = {}
@@ -6060,5 +6155,6 @@ class TestEvidencePostureNeverGatesStartup:
             await runtime.stop()
 
         await asyncio.gather(runtime.start(), _observe_then_stop())
-        assert observed["health"]["evidence"]["posture_problems"] == []
-        assert observed["health"].get("status") != "degraded"
+        assert observed["health"]["evidence"]["posture_problems"] == expected
+        assert (observed["health"].get("status") == "degraded") is bool(expected)
+        assert observed["health"].get("critical") is not True

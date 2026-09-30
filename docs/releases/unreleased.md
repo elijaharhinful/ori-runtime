@@ -333,12 +333,18 @@ candidate or release is cut.
   records the version as `contract_version`. The runtime claims
   `evidence-exchange/v2` (with its receiver-state corpus), `evidence/v3`
   (its chain-row corpus is `chain-row-v3.json`, vendored under
-  `tests/vectors/evidence`), `runtime-evidence-anchor/v2` and
-  `commissioned-safety-binding/v2`, each pinned at ori-specs `06ba18e`; the
-  gateway-api, safety-profile and sensor-configuration sets are unchanged and
-  keep their pins. The disposition corpus is held to for its re-offer
-  schedule, its overdue bound and its canonical bytes; the courier's routing
-  projection is vendored for the drift check and owned by the gateway.
+  `tests/vectors/evidence`) and `runtime-evidence-anchor/v2`, pinned together
+  at ori-specs `013be1b`, and `commissioned-safety-binding/v2` at `06ba18e`;
+  the gateway-api, safety-profile and sensor-configuration sets keep their
+  pins. The delivery-receipt and epoch-confirmation corpora are their `-v2`
+  files, whose key ids derive from the signing keys: each case is replayed end
+  to end against the authority key registry the corpus embeds, loaded through
+  the conforming loader, selected by `(purpose, key_id)` and verified under the
+  selected key. The disposition corpus is held to for its re-offer schedule,
+  its overdue bound and its canonical bytes, and its registry of derived ids
+  and `revoked` status loads through the same loader, which selects each wire
+  case's key or refuses it for the reason the corpus names; the courier's
+  routing projection is vendored for the drift check and owned by the gateway.
 
 - Three action-registry entries that governed physical actions with no executor
   behind them — `emergency_cutoff`, `open_safety_circuit` and
@@ -874,6 +880,30 @@ candidate or release is cut.
   still be lost at the writer's ceiling, on a store error or at shutdown.
 
 ## Security
+
+- The loader for the evidence authority key registry is implemented to
+  `evidence-exchange/v2`; the registry itself does not ship yet, and
+  disposition verification is not wired. Every member must be a string, both
+  hexadecimal members lowercase, and each `key_id` is recomputed from its public
+  key rather than taken on trust. A public key must decode as a canonical
+  Ed25519 point under RFC 8032 section 5.1.3 and must not be of small order,
+  decided by curve arithmetic; a registry holding one key under two purposes, or
+  a purpose with no `active` key or more than one, is refused; and one refused
+  key refuses the whole registry. The disposition purpose is accepted and
+  parsed, but no disposition verifier is installed, so a disposition key
+  verifies nothing. A revoked key now rejects an artifact as `retired_key`
+  rather than `unknown_key`. A shipped registry the loader refuses, or one
+  holding a key whose seed this repository publishes, is logged at error and
+  read as holding no keys: evidence verification stops and health reports
+  `authority_keys_refused`, and the runtime still starts, where a present but
+  unreadable registry previously failed startup. A registry that loads without
+  a verifying key for every purpose this release verifies (receipt and epoch)
+  reports `authority_keys_incomplete`; an absent one still reports
+  `authority_keys_missing`. Each is degraded, never critical, and never a
+  startup gate. The registry is package data at
+  `ori/security/evidence-authority-keys.json`; with none shipped, every
+  authority artifact is still refused `unknown_key`. The contract's corpus is
+  replayed in full through the loader.
 
 - A trust anchor whose private key this repository publishes is refused, at
   every deployment profile. This repository commits Ed25519 seeds as test
