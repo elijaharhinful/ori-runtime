@@ -523,6 +523,34 @@ candidate or release is cut.
 
 ## Fixed
 
+- A delivery receipt issued per `evidence-exchange/v2` is accepted. The
+  runtime recomputed a receipt's `range_digest` over the sealed envelopes'
+  envelope digests, which cover the wire bytes, while the contract takes it
+  over the raw 32-byte `chain_row_digest` values for `from_seq..to_seq` in
+  ascending `local_seq` order; every receipt the evidence authority issued was
+  verified and then refused `binding_mismatch`, and no envelope was ever
+  marked delivered. The ledger now supplies the `chain_row_digest` each
+  envelope was sealed with, and the range is recomputed over those. A stored
+  digest that is not `sha256:` and 64 lowercase hex digits refuses the receipt
+  `binding_mismatch` rather than raising. The custody acknowledgement's
+  `envelope_digest` is unchanged: the contract defines it over the wire bytes.
+  An envelope whose receipt was refused stays in custody and unreceipted; the
+  runtime does not re-offer an envelope a courier holds, so it is receipted
+  only when the authority's receipt for it is delivered again.
+- A correctly signed receipt naming a very wide interval is refused
+  `unknown_sequence` at once. The verifier enumerated every integer in
+  `from_seq..to_seq` after the signature check, so a receipt up to the
+  contract's integer limit held the evidence worker; it now counts the claimed
+  interval and walks only the sealed rows inside it, and the applied sequences
+  are those rows.
+- Every field of an authority artifact must carry its contract's exact JSON
+  type. `"v": true` was read as version 1 because Python compares
+  `True == 1`, and string fields were coerced, so a re-signed epoch
+  confirmation with `"actor": true` was accepted as actor `True`. Each custody
+  acknowledgement, delivery receipt and epoch confirmation field is now typed
+  `int` (not a boolean, inside the contract's integer zone) or `str` before
+  anything reads it, and a field of any other type is refused `malformed`; a
+  verified disposition's `decided_at_ms` is held to the same integer rule.
 - HTTP telemetry export sends the readings the runtime publishes. The poll loop
   and the firmware telemetry subscriber publish a reading as
   `sensor.<sensor_type>`, and the exporter admitted only `sensor.reading`, so a

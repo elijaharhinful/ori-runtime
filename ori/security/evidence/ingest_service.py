@@ -165,7 +165,7 @@ class EvidenceIngestService:
         from_seq = _int_field(artifact, "from_seq")
         to_seq = _int_field(artifact, "to_seq")
         digests = (
-            self._ledger.envelope_digests(from_seq, to_seq)
+            self._ledger.chain_row_digests(from_seq, to_seq)
             if from_seq is not None and to_seq is not None and to_seq >= from_seq
             else {}
         )
@@ -174,12 +174,12 @@ class EvidenceIngestService:
                 artifact,
                 device_id=self._device_id,
                 registry=self._registry,
-                envelope_digests=digests,
+                chain_row_digests=digests,
             )
         except IngestRejectedError as exc:
             return self._refuse("delivery_receipt", exc)
 
-        applied = tuple(range(verified.from_seq, verified.to_seq + 1))
+        applied = verified.sequences
         for local_seq in applied:
             self._ledger._apply_verified_receipt(
                 local_seq, receipt_at_ms=verified.accepted_at_ms, key_id=verified.key_id
@@ -191,10 +191,11 @@ class EvidenceIngestService:
     def accept_disposition(self, artifact: object) -> IngestOutcome:
         """Apply a verified evidence disposition, in the contract's order.
 
-        The verifier is the seam for steps 1 to 3; the one installed on this
-        release verifies nothing, so every disposition is refused and nothing
-        changes. Steps 4 to 6 are decided here and in the ledger, and a refusal
-        at any step changes nothing.
+        The verifier checks the artifact's shape, key and signature; the one
+        installed on this release verifies nothing, so every disposition is
+        refused and nothing changes. Whether it names this device, an artifact
+        this device sealed, and an effect not already in force is decided here
+        and in the ledger, and any refusal changes nothing.
         """
         try:
             verified = self._disposition_verifier.verify_disposition(artifact)

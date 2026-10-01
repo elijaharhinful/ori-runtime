@@ -1337,7 +1337,7 @@ class EvidenceDeliveryLedger:
     def _apply_verified_disposition(
         self, disposition: VerifiedDisposition, *, at_ms: int
     ) -> str:
-        """Verification steps 4 to 6 and the effect, in one transaction.
+        """The checks local state decides, and the effect, in one transaction.
 
         Not a public boundary: it trusts the signature it is told was checked.
         It checks everything local state can decide -- the device, that the
@@ -1724,7 +1724,7 @@ class EvidenceDeliveryLedger:
 
         # The outer columns are what a reader queries; the envelope is what was
         # signed. A row whose columns describe a different event than its bytes
-        # is what rules 5 to 10 of the chain contract exist to catch.
+        # is what the chain contract's row-consistency rules exist to catch.
         for field, column in (
             ("sequence_num", "seq"),
             ("prev_event_hash", "prev_event_hash"),
@@ -1980,14 +1980,18 @@ class EvidenceDeliveryLedger:
         ).fetchone()
         return row
 
-    def envelope_digests(self, from_seq: int, to_seq: int) -> dict[int, str]:
-        """Digests for a closed interval, for checking a receipt's range claim."""
+    def chain_row_digests(self, from_seq: int, to_seq: int) -> dict[int, str]:
+        """Each sealed envelope's `chain_row_digest`, as written at seal, for a range.
+
+        What a receipt's range digest is taken over. The column is immutable
+        once sealed, so this is the value the authority verified.
+        """
         rows = self._connection.execute(
-            "SELECT local_seq, envelope_digest FROM evidence_delivery_ledger"
+            "SELECT local_seq, chain_row_digest FROM evidence_delivery_ledger"
             " WHERE local_seq BETWEEN ? AND ?",
             (int(from_seq), int(to_seq)),
         )
-        return {int(r["local_seq"]): str(r["envelope_digest"]) for r in rows}
+        return {int(r["local_seq"]): str(r["chain_row_digest"]) for r in rows}
 
     def _require_sealed(self, local_seq: int) -> sqlite3.Row:
         """Refuse to act on a sequence this ledger never allocated.

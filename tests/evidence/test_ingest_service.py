@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import pathlib
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -34,6 +35,7 @@ from ori.security.evidence.device_key import EvidenceDeviceKey
 from ori.security.evidence.ingest import (
     REJECT_BAD_AUTHENTICATOR,
     REJECT_BINDING_MISMATCH,
+    REJECT_MALFORMED,
     REJECT_UNKNOWN_KEY,
     REJECT_UNKNOWN_SEQUENCE,
     REJECT_WRONG_PURPOSE,
@@ -156,21 +158,48 @@ def _seal(chain, ledger, n: int):
     return ledger.seal(row, sealed_at_ms=1000 + n)
 
 
+def _wire_digests(ledger, from_seq: int, to_seq: int, field: str) -> list[str]:
+    """A field of each sealed envelope as the authority receives it, in order.
+
+    Read from the envelope's wire bytes and never from the ledger's own range
+    query, so a ledger that answered the wrong column could not agree with
+    itself here.
+    """
+    out = []
+    for seq in range(from_seq, to_seq + 1):
+        sealed = ledger.find_by_local_seq(seq)
+        wire = str(sealed["envelope_json"]).encode()
+        if field == "envelope_digest":
+            out.append("sha256:" + hashlib.sha256(wire).hexdigest())
+        else:
+            out.append(json.loads(wire)[field])
+    return out
+
+
+def _range_digest(digests: list[str]) -> str:
+    raw = b"".join(bytes.fromhex(d.removeprefix("sha256:")) for d in digests)
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
 def _receipt(
-    ledger, from_seq: int, to_seq: int, seed=RECEIPT_SEED, key_id=RECEIPT_KEY_ID
+    ledger,
+    from_seq: int,
+    to_seq: int,
+    seed=RECEIPT_SEED,
+    key_id=RECEIPT_KEY_ID,
+    *,
+    over: str = "chain_row_digest",
 ):
-    digests = ledger.envelope_digests(from_seq, to_seq)
-    raw = b"".join(
-        bytes.fromhex(digests[s].split("sha256:")[1])
-        for s in range(from_seq, to_seq + 1)
-    )
+    """A receipt per evidence-exchange: the range over raw chain row digests."""
     return _sign(
         {
             "v": 1,
             "device_id": DEVICE,
             "from_seq": from_seq,
             "to_seq": to_seq,
-            "range_digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+            "range_digest": _range_digest(
+                _wire_digests(ledger, from_seq, to_seq, over)
+            ),
             "accepted_at_ms": 1787000001000,
             "key_id": key_id,
         },
@@ -244,6 +273,331 @@ def test_a_verified_receipt_marks_its_range_delivered(rig):
     assert outcome.accepted
     assert outcome.applied_sequences == (1, 2)
     assert [r["local_seq"] for r in ledger.undelivered()] == [3]
+
+
+def test_the_ledger_supplies_each_chain_row_digest_it_sealed(rig):
+    """The range is over chain row digests, which are not envelope digests."""
+    _, chain, ledger, _ = rig
+    for n in (1, 2, 3):
+        _seal(chain, ledger, n)
+
+    held = ledger.chain_row_digests(1, 3)
+    assert [held[s] for s in (1, 2, 3)] == _wire_digests(
+        ledger, 1, 3, "chain_row_digest"
+    )
+    assert set(held.values()).isdisjoint(_wire_digests(ledger, 1, 3, "envelope_digest"))
+    assert ledger.chain_row_digests(2, 9).keys() == {2, 3}
+
+
+def test_a_receipt_over_envelope_digests_is_refused(rig):
+    """Envelope digests cover the wire bytes; the contract's range does not."""
+    _, chain, ledger, service = rig
+    for n in (1, 2):
+        _seal(chain, ledger, n)
+
+    outcome = service.accept_receipt(_receipt(ledger, 1, 2, over="envelope_digest"))
+    assert not outcome.accepted
+    assert outcome.reason == REJECT_BINDING_MISMATCH
+    assert [r["local_seq"] for r in ledger.undelivered()] == [1, 2], "state changed"
+
+
+def test_a_single_envelope_receipt_is_accepted(rig):
+    """The shape the authority issues: one receipt per accepted envelope."""
+    _, chain, ledger, service = rig
+    _seal(chain, ledger, 1)
+
+    outcome = service.accept_receipt(_receipt(ledger, 1, 1))
+    assert outcome.accepted
+    assert outcome.applied_sequences == (1,)
+    assert ledger.find_by_local_seq(1)["receipt_state"] == RECEIPT_ACCEPTED
+
+
+def test_a_range_digest_in_descending_order_is_refused(rig):
+    """Ascending `local_seq` order is part of what the digest commits to."""
+    _, chain, ledger, service = rig
+    for n in (1, 2, 3):
+        _seal(chain, ledger, n)
+    artifact = _receipt(ledger, 1, 3)
+    artifact["range_digest"] = _range_digest(
+        list(reversed(_wire_digests(ledger, 1, 3, "chain_row_digest")))
+    )
+    _sign(artifact, RECEIPT_DOMAIN, RECEIPT_SEED)
+
+    outcome = service.accept_receipt(artifact)
+    assert not outcome.accepted
+    assert outcome.reason == REJECT_BINDING_MISMATCH
+    assert [r["local_seq"] for r in ledger.undelivered()] == [1, 2, 3]
+
+    assert service.accept_receipt(_receipt(ledger, 1, 3)).applied_sequences == (
+        1,
+        2,
+        3,
+    )
+
+
+def test_an_unreadable_sealed_chain_row_digest_refuses_rather_than_raises(rig):
+    """A damaged stored digest cannot be checked, so nothing is applied."""
+    _, chain, ledger, service = rig
+    for n in (1, 2):
+        _seal(chain, ledger, n)
+    artifact = _receipt(ledger, 1, 2)
+    ledger._connection.execute("DROP TRIGGER evidence_ledger_no_sealed_update")
+    ledger._connection.execute(
+        "UPDATE evidence_delivery_ledger SET chain_row_digest = 'sha256:zz'"
+        " WHERE local_seq = 2"
+    )
+
+    outcome = service.accept_receipt(artifact)
+    assert outcome.reason == REJECT_BINDING_MISMATCH
+    assert [r["local_seq"] for r in ledger.undelivered()] == [1, 2]
+
+
+def test_a_receipt_reaching_past_the_sealed_head_is_unknown_sequence(rig):
+    _, chain, ledger, service = rig
+    for n in (1, 2):
+        _seal(chain, ledger, n)
+    artifact = _receipt(ledger, 1, 2)
+    artifact["to_seq"] = 3
+    _sign(artifact, RECEIPT_DOMAIN, RECEIPT_SEED)
+
+    outcome = service.accept_receipt(artifact)
+    assert outcome.reason == REJECT_UNKNOWN_SEQUENCE
+    assert [r["local_seq"] for r in ledger.undelivered()] == [1, 2]
+
+
+def test_a_receipt_at_the_largest_json_integer_is_refused_promptly(rig):
+    """The signed interval's width is counted, never enumerated.
+
+    An alarm interrupts an enumeration rather than letting it run for the
+    life of the suite; the ceiling is generous because the property is "does
+    not walk the interval", not a latency budget.
+    """
+    import signal
+
+    def _expired(signum, frame):
+        raise TimeoutError("the receipt interval was enumerated")
+
+    _, chain, ledger, service = rig
+    for n in (1, 2):
+        _seal(chain, ledger, n)
+    previous = signal.signal(signal.SIGALRM, _expired)
+    try:
+        for from_seq in (1, 3):
+            artifact = _receipt(ledger, 1, 2)
+            artifact["from_seq"], artifact["to_seq"] = from_seq, 9007199254740991
+            _sign(artifact, RECEIPT_DOMAIN, RECEIPT_SEED)
+            signal.setitimer(signal.ITIMER_REAL, 5.0)
+            try:
+                outcome = service.accept_receipt(artifact)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            assert outcome.reason == REJECT_UNKNOWN_SEQUENCE
+            assert [r["local_seq"] for r in ledger.undelivered()] == [1, 2]
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+
+
+NOT_INTEGERS = (True, False, 1.0, "1")
+
+
+@pytest.mark.parametrize("bad", NOT_INTEGERS, ids=repr)
+@pytest.mark.parametrize("field", ["v", "from_seq", "to_seq", "accepted_at_ms"])
+def test_a_receipt_integer_of_another_json_type_is_malformed(rig, field, bad):
+    """Re-signed, so the refusal can only come from the type."""
+    _, chain, ledger, service = rig
+    _seal(chain, ledger, 1)
+    artifact = _receipt(ledger, 1, 1)
+    artifact[field] = bad
+    _sign(artifact, RECEIPT_DOMAIN, RECEIPT_SEED)
+
+    outcome = service.accept_receipt(artifact)
+    assert outcome.reason == REJECT_MALFORMED
+    assert ledger.find_by_local_seq(1)["receipt_state"] == RECEIPT_NONE
+
+
+@pytest.mark.parametrize("bad", NOT_INTEGERS, ids=repr)
+@pytest.mark.parametrize("field", ["v", "local_seq", "custody_at_ms"])
+def test_a_custody_integer_of_another_json_type_is_malformed(rig, field, bad):
+    _, chain, ledger, service = rig
+    _seal(chain, ledger, 1)
+    artifact = _custody(ledger, 1)
+    artifact[field] = bad
+    _mac(artifact, CUSTODY_SECRET)
+
+    outcome = service.accept_custody(artifact)
+    assert outcome.reason == REJECT_MALFORMED
+    assert ledger.find_by_local_seq(1)["custody_state"] != CUSTODY_HELD
+
+
+@pytest.mark.parametrize("bad", NOT_INTEGERS, ids=repr)
+@pytest.mark.parametrize("field", ["v", "confirmed_at_ms"])
+def test_an_epoch_integer_of_another_json_type_is_malformed(rig, field, bad):
+    key, _, ledger, service = rig
+    _register(ledger, key)
+    artifact = _confirmation(key.public_key_hex)
+    artifact[field] = bad
+    _sign(artifact, EPOCH_DOMAIN, EPOCH_SEED)
+
+    outcome = service.accept_epoch_confirmation(artifact)
+    assert outcome.reason == REJECT_MALFORMED
+    assert ledger.confirmed_epoch(DEVICE) is None
+
+
+NOT_STRINGS = (None, True, 1, ["x"], {"x": "y"})
+
+
+@pytest.mark.parametrize("bad", NOT_STRINGS, ids=repr)
+@pytest.mark.parametrize("field", ["device_id", "range_digest", "key_id", "signature"])
+def test_a_receipt_string_of_another_json_type_is_malformed(rig, field, bad):
+    _, chain, ledger, service = rig
+    _seal(chain, ledger, 1)
+    artifact = _receipt(ledger, 1, 1)
+    artifact[field] = bad
+    if field != "signature":
+        _sign(artifact, RECEIPT_DOMAIN, RECEIPT_SEED)
+
+    outcome = service.accept_receipt(artifact)
+    assert outcome.reason == REJECT_MALFORMED
+    assert ledger.find_by_local_seq(1)["receipt_state"] == RECEIPT_NONE
+
+
+@pytest.mark.parametrize("bad", NOT_STRINGS, ids=repr)
+@pytest.mark.parametrize("field", ["device_id", "envelope_digest", "key_id", "mac"])
+def test_a_custody_string_of_another_json_type_is_malformed(rig, field, bad):
+    _, chain, ledger, service = rig
+    _seal(chain, ledger, 1)
+    artifact = _custody(ledger, 1)
+    artifact[field] = bad
+    if field != "mac":
+        _mac(artifact, CUSTODY_SECRET)
+
+    outcome = service.accept_custody(artifact)
+    assert outcome.reason == REJECT_MALFORMED
+    assert ledger.find_by_local_seq(1)["custody_state"] != CUSTODY_HELD
+
+
+@pytest.mark.parametrize("bad", NOT_STRINGS, ids=repr)
+@pytest.mark.parametrize(
+    "field",
+    ["device_id", "anchor_epoch_id", "pubkey_hex", "actor", "key_id", "signature"],
+)
+def test_an_epoch_string_of_another_json_type_is_malformed(rig, field, bad):
+    key, _, ledger, service = rig
+    _register(ledger, key)
+    artifact = _confirmation(key.public_key_hex)
+    artifact[field] = bad
+    if field != "signature":
+        _sign(artifact, EPOCH_DOMAIN, EPOCH_SEED)
+
+    outcome = service.accept_epoch_confirmation(artifact)
+    assert outcome.reason == REJECT_MALFORMED
+    assert ledger.confirmed_epoch(DEVICE) is None
+
+
+def test_the_valid_artifacts_still_pass_the_integer_check(rig):
+    """The negative cases above differ from accepted ones only in the field."""
+    key, chain, ledger, service = rig
+    _seal(chain, ledger, 1)
+    _register(ledger, key)
+    assert service.accept_custody(_custody(ledger, 1)).accepted
+    assert service.accept_receipt(_receipt(ledger, 1, 1)).accepted
+    assert service.accept_epoch_confirmation(_confirmation(key.public_key_hex)).accepted
+
+
+# --------------------------------------------------------------------------
+# The contract's receipt corpus, through a real ledger
+# --------------------------------------------------------------------------
+
+EXCHANGE_VECTORS = (
+    pathlib.Path(__file__).parent.parent / "vectors" / "evidence_exchange"
+)
+
+
+def _exchange(name: str) -> dict:
+    return json.loads((EXCHANGE_VECTORS / name).read_text())
+
+
+@pytest.fixture
+def vector_rig(tmp_path):
+    """A ledger holding the envelope corpus's chain row at its published `local_seq`.
+
+    The corpus publishes the device seed and the chain row, so the envelope the
+    authority receipted is reached by sealing, not by feeding the verifier a
+    digest table: the range digest is then checked against whatever the ledger
+    actually stored.
+    """
+    envelopes = _exchange("delivery-envelope.json")
+    receipts = _exchange("delivery-receipt-v2.json")
+    published = next(c for c in envelopes["cases"] if c["name"] == "valid")["artifact"]
+    assert published["device_id"] == DEVICE
+
+    key = EvidenceDeviceKey.load_or_create(tmp_path / "vector.key", "vector-secret")
+    key._private = Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex(envelopes["signing_key_seed_hex"])
+    )
+    key._public = key._private.public_key()
+    chain = EvidenceChain(tmp_path / "chain.db", key, DEVICE)
+    ledger = EvidenceDeliveryLedger(
+        tmp_path / "ledger.db",
+        key,
+        DEVICE,
+        anchor_epoch_id=published["anchor_epoch_id"],
+        key_id=published["key_id"],
+    )
+    for n in range(1, int(published["local_seq"])):
+        _seal(chain, ledger, n)
+    sealed = ledger.seal(dict(published["chain_row"]), sealed_at_ms=1787000000512)
+    assert int(sealed["local_seq"]) == int(published["local_seq"])
+    assert sealed["chain_row_digest"] == published["chain_row_digest"]
+
+    registry_path = tmp_path / "authority.json"
+    registry_path.write_text(json.dumps(receipts["authority_key_registry"]))
+    service = EvidenceIngestService(
+        ledger=ledger,
+        registry=load_authority_key_registry(registry_path),
+        device_id=DEVICE,
+        device_pubkey_hex=key.public_key_hex,
+        custody_keys=CustodyKeyRegistry(active_secret=CUSTODY_SECRET),
+    )
+    yield ledger, service, receipts
+    chain.close()
+    ledger.close()
+
+
+@pytest.mark.parametrize(
+    ("case_name", "reason"),
+    [
+        ("valid", None),
+        ("signed_with_epoch_key", REJECT_BAD_AUTHENTICATOR),
+        # Every sequence in 9..12 is sealed here, so what refuses it is the
+        # range digest covering 12 alone.
+        ("non_contiguous_range", REJECT_BINDING_MISMATCH),
+    ],
+)
+def test_every_receipt_vector_reaches_its_outcome_through_the_ledger(
+    vector_rig, case_name, reason
+):
+    ledger, service, receipts = vector_rig
+    published = next(c for c in receipts["cases"] if c["name"] == case_name)
+    assert [c["name"] for c in receipts["cases"]] == [
+        "valid",
+        "signed_with_epoch_key",
+        "non_contiguous_range",
+    ], "a receipt case was added; give it an outcome here"
+    assert receipts["valid_range_chain_row_digests"] == [
+        ledger.find_by_local_seq(12)["chain_row_digest"]
+    ]
+
+    outcome = service.accept_receipt(published["artifact"])
+    if published["expected"] == "accept":
+        assert reason is None
+        assert outcome.accepted
+        assert outcome.applied_sequences == (12,)
+        assert ledger.find_by_local_seq(12)["receipt_state"] == RECEIPT_ACCEPTED
+        return
+    assert not outcome.accepted
+    assert outcome.reason == reason
+    assert ledger.find_by_local_seq(12)["receipt_state"] == RECEIPT_NONE
 
 
 # Each case is re-signed after being corrupted, except the one whose defect
@@ -547,7 +901,7 @@ def test_an_artifact_lost_between_verification_and_application_is_safely_replaya
         artifact,
         device_id=DEVICE,
         registry=service._registry,
-        envelope_digests=ledger.envelope_digests(1, 1),
+        chain_row_digests=ledger.chain_row_digests(1, 1),
     )
     assert ledger.find_by_local_seq(1)["receipt_state"] == RECEIPT_NONE, (
         "verification must not mutate state on its own"

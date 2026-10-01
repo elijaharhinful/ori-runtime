@@ -4,11 +4,11 @@
 """The seam through which an evidence disposition reaches the runtime's state.
 
 Per `evidence-exchange/v2`, *Evidence disposition*. A verifier proves the
-artifact's shape, key and signature (verification steps 1 to 3) and hands a
-`VerifiedDisposition` across this seam; the runtime then checks the device,
-the binding to an artifact it sealed, and whether the effect is already in
-force (steps 4 to 6), and applies the effect. No verifier is installed on this
-release, so `NoDispositionVerifier` verifies nothing.
+artifact's shape, key and signature and hands a `VerifiedDisposition` across
+this seam; the runtime then checks the device, the binding to an artifact it
+sealed, and whether the effect is already in force, and applies the effect.
+No verifier is installed on this release, so `NoDispositionVerifier` verifies
+nothing.
 """
 
 from __future__ import annotations
@@ -76,8 +76,16 @@ class NoDispositionVerifier:
         return None
 
 
+#: The contract's integer zone.
+_MAX_JSON_INTEGER = 9007199254740991
+
+
 def disposition_fault(disposition: VerifiedDisposition) -> str | None:
     """Why a verified disposition is malformed, or None when its shape holds."""
+    if type(disposition.decided_at_ms) is not int or not (
+        -_MAX_JSON_INTEGER <= disposition.decided_at_ms <= _MAX_JSON_INTEGER
+    ):
+        return "the disposition's decided_at_ms is not an integer"
     if not isinstance(disposition.value, DispositionValue):
         return "the disposition value is outside the closed vocabulary"
     if not isinstance(disposition.scope, DispositionScope):

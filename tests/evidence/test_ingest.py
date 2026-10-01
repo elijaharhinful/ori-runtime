@@ -38,6 +38,12 @@ from ori.security.evidence.custody_keys import (
     derive_custody_key_id,
 )
 from ori.security.evidence.ingest import (
+    CUSTODY_FIELDS,
+    CUSTODY_SHAPE,
+    EPOCH_FIELDS,
+    EPOCH_SHAPE,
+    RECEIPT_FIELDS,
+    RECEIPT_SHAPE,
     REJECT_BAD_AUTHENTICATOR,
     REJECT_BINDING_MISMATCH,
     REJECT_MALFORMED,
@@ -50,6 +56,7 @@ from ori.security.evidence.ingest import (
     REJECT_UNRECOGNISED_VERSION,
     REJECT_WRONG_PURPOSE,
     IngestRejectedError,
+    _require_shape,
     verify_custody_acknowledgement,
     verify_delivery_receipt,
     verify_epoch_confirmation,
@@ -125,7 +132,7 @@ def _replay_context(name: str, artifact: dict) -> dict:
     if name == "delivery-receipt-v2":
         valid = case(name, "valid")["artifact"]
         return {
-            "envelope_digests": _digests_for(
+            "chain_row_digests": _digests_for(
                 valid["from_seq"], valid["to_seq"], valid["range_digest"]
             )
         }
@@ -241,22 +248,20 @@ def test_a_malformed_registry_is_refused(tmp_path, mutate, expected):
 def _digests_for(
     from_seq: int, to_seq: int, expected_range_digest: str
 ) -> dict[int, str]:
-    """Envelope digests that reproduce the vector's published range digest."""
+    """The envelope corpus's published `chain_row_digest` values, by `local_seq`.
+
+    Taken from the field the envelope carries, not recomputed: the receipt
+    corpus names the same values, so the two corpora are held to each other.
+    """
     published = vector("delivery-envelope")
-    valid = next(c for c in published["cases"] if c["name"] == "valid")["artifact"]
-    reordered = next(c for c in published["cases"] if c["name"] == "reordered_batch")[
-        "artifact"
-    ]
     digests = {
-        int(valid["local_seq"]): "sha256:"
-        + hashlib.sha256(valid["chain_row"]["canonical_json"].encode()).hexdigest(),
-        int(reordered["local_seq"]): "sha256:"
-        + hashlib.sha256(reordered["chain_row"]["canonical_json"].encode()).hexdigest(),
+        int(c["artifact"]["local_seq"]): str(c["artifact"]["chain_row_digest"])
+        for c in published["cases"]
+        if c["name"] in ("valid", "reordered_batch")
     }
-    concatenated = b"".join(
-        bytes.fromhex(digests[seq].split("sha256:")[1])
-        for seq in range(from_seq, to_seq + 1)
-    )
+    in_range = [digests[seq] for seq in range(from_seq, to_seq + 1)]
+    assert in_range == vector("delivery-receipt-v2")["valid_range_chain_row_digests"]
+    concatenated = b"".join(bytes.fromhex(d.removeprefix("sha256:")) for d in in_range)
     assert (
         "sha256:" + hashlib.sha256(concatenated).hexdigest() == expected_range_digest
     ), "the fixture does not reproduce the vector's range digest"
@@ -269,7 +274,7 @@ def test_the_valid_receipt_verifies(registry):
         artifact["from_seq"], artifact["to_seq"], artifact["range_digest"]
     )
     verified = verify_delivery_receipt(
-        artifact, device_id=DEVICE, registry=registry, envelope_digests=digests
+        artifact, device_id=DEVICE, registry=registry, chain_row_digests=digests
     )
     assert verified.from_seq == artifact["from_seq"]
     assert verified.to_seq == artifact["to_seq"]
@@ -292,7 +297,7 @@ def test_a_receipt_signed_with_the_epoch_key_is_refused(registry):
     ), "this case is only meaningful while it names the correct key id"
     with pytest.raises(IngestRejectedError) as raised:
         verify_delivery_receipt(
-            artifact, device_id=DEVICE, registry=registry, envelope_digests={}
+            artifact, device_id=DEVICE, registry=registry, chain_row_digests={}
         )
     assert raised.value.reason == REJECT_BAD_AUTHENTICATOR
 
@@ -301,7 +306,7 @@ def test_a_non_contiguous_receipt_is_refused(registry):
     artifact = case("delivery-receipt-v2", "non_contiguous_range")["artifact"]
     with pytest.raises(IngestRejectedError) as raised:
         verify_delivery_receipt(
-            artifact, device_id=DEVICE, registry=registry, envelope_digests={}
+            artifact, device_id=DEVICE, registry=registry, chain_row_digests={}
         )
     assert raised.value.reason in {REJECT_NON_CONTIGUOUS, REJECT_UNKNOWN_SEQUENCE}
 
@@ -313,7 +318,7 @@ def test_a_receipt_for_another_device_is_refused(registry):
             artifact,
             device_id="some-other-device",
             registry=registry,
-            envelope_digests=_digests_for(
+            chain_row_digests=_digests_for(
                 artifact["from_seq"], artifact["to_seq"], artifact["range_digest"]
             ),
         )
@@ -325,7 +330,7 @@ def test_a_receipt_covering_unsealed_sequences_is_refused(registry):
     artifact = case("delivery-receipt-v2", "valid")["artifact"]
     with pytest.raises(IngestRejectedError) as raised:
         verify_delivery_receipt(
-            artifact, device_id=DEVICE, registry=registry, envelope_digests={}
+            artifact, device_id=DEVICE, registry=registry, chain_row_digests={}
         )
     assert raised.value.reason == REJECT_UNKNOWN_SEQUENCE
 
@@ -339,7 +344,7 @@ def test_a_receipt_whose_range_digest_disagrees_is_refused(registry):
     digests[artifact["to_seq"]] = "sha256:" + "0" * 64
     with pytest.raises(IngestRejectedError) as raised:
         verify_delivery_receipt(
-            artifact, device_id=DEVICE, registry=registry, envelope_digests=digests
+            artifact, device_id=DEVICE, registry=registry, chain_row_digests=digests
         )
     assert raised.value.reason == REJECT_BINDING_MISMATCH
 
@@ -386,7 +391,7 @@ def test_an_artifact_naming_a_key_held_for_another_purpose_is_refused(registry):
     artifact["key_id"] = case("epoch-confirmation-v2", "valid")["artifact"]["key_id"]
     with pytest.raises(IngestRejectedError) as raised:
         verify_delivery_receipt(
-            artifact, device_id=DEVICE, registry=registry, envelope_digests={}
+            artifact, device_id=DEVICE, registry=registry, chain_row_digests={}
         )
     assert raised.value.reason == REJECT_WRONG_PURPOSE
 
@@ -685,7 +690,7 @@ def test_a_tombstone_cannot_name_a_generation_that_still_holds_a_secret():
 @pytest.mark.parametrize(
     "verifier,name,kwargs",
     [
-        (verify_delivery_receipt, "delivery-receipt-v2", {"envelope_digests": {}}),
+        (verify_delivery_receipt, "delivery-receipt-v2", {"chain_row_digests": {}}),
         (
             verify_epoch_confirmation,
             "epoch-confirmation-v2",
@@ -715,7 +720,7 @@ def test_an_undefined_field_is_rejected(registry, name):
     artifact = dict(case(name, "valid")["artifact"])
     artifact["unexpected"] = True
     kwargs = (
-        {"envelope_digests": {}}
+        {"chain_row_digests": {}}
         if name == "delivery-receipt-v2"
         else {"expected_pubkey_hex": "00" * 32}
     )
@@ -805,3 +810,36 @@ def test_the_verifiers_only_use_published_reasons():
     assert used <= REJECT_REASONS, (
         f"unpublished reasons in use: {sorted(used - REJECT_REASONS)}"
     )
+
+
+# --------------------------------------------------------------------------
+# Every field is typed
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("shape", "fields", "name"),
+    [
+        (CUSTODY_SHAPE, CUSTODY_FIELDS, "custody-acknowledgement"),
+        (RECEIPT_SHAPE, RECEIPT_FIELDS, "delivery-receipt-v2"),
+        (EPOCH_SHAPE, EPOCH_FIELDS, "epoch-confirmation-v2"),
+    ],
+)
+def test_every_required_field_is_classified_once_by_its_json_type(shape, fields, name):
+    """The required set is the shape's keys, and the shape matches the contract.
+
+    A field the corpus carries that the shape does not, or one the shape types
+    differently from the corpus's valid case, fails here before it can be read
+    untyped.
+    """
+    assert fields == frozenset(shape)
+    assert set(shape.values()) <= {int, str}
+    valid = case(name, "valid")["artifact"]
+    assert {k: type(v) for k, v in valid.items()} == dict(shape)
+
+
+def test_a_field_typed_outside_the_known_json_types_refuses():
+    """An unrecognised declared type fails closed rather than admitting anything."""
+    with pytest.raises(IngestRejectedError) as raised:
+        _require_shape({"v": 1, "x": 1.5}, {"v": int, "x": float}, "probe")
+    assert raised.value.reason == REJECT_MALFORMED
