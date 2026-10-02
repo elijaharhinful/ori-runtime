@@ -267,7 +267,10 @@ def _add_skills(
 
 
 def _run_skills_validate(args: argparse.Namespace) -> int:
+    import yaml
+
     from ori.skills.loader import SkillLoader, SkillValidationError
+    from ori.skills.sandbox import SkillSecurityError
 
     target = Path(args.path)
     stream = _out(args)
@@ -312,9 +315,47 @@ def _run_skills_validate(args: argparse.Namespace) -> int:
                 + f"\n  {exc}",
             )
             return EXIT_FAILED
+        except SkillSecurityError as exc:
+            payload = {"status": "invalid", "error": str(exc)}
+            _emit(
+                args,
+                payload,
+                terminal.failure(f"\u2718 Invalid: {shown(str(target))}", stream=stream)
+                + f"\n  {exc}",
+            )
+            return EXIT_FAILED
+        except yaml.YAMLError as exc:
+            payload = {"status": "invalid", "error": str(exc)}
+            _emit(
+                args,
+                payload,
+                terminal.failure(
+                    f"\u2718 Malformed YAML: {shown(str(target))}", stream=stream
+                )
+                + f"\n  {exc}",
+            )
+            return EXIT_FAILED
+        except OSError as exc:
+            msg = f"ori: could not read {shown(str(target))}: {exc.strerror or exc}"
+            if getattr(args, "json", False):
+                json.dump({"status": "error", "error": msg}, sys.stdout)
+                sys.stdout.write("\n")
+            else:
+                print(msg, file=sys.stderr)
+            return EXIT_UNUSABLE
 
     # Parent directory: validate every skill inside it
-    skill_dirs = [d for d in sorted(target.iterdir()) if d.is_dir()]
+    try:
+        skill_dirs = [d for d in sorted(target.iterdir()) if d.is_dir()]
+    except OSError as exc:
+        msg = f"ori: could not read {shown(str(target))}: {exc.strerror or exc}"
+        if getattr(args, "json", False):
+            json.dump({"status": "error", "error": msg}, sys.stdout)
+            sys.stdout.write("\n")
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_UNUSABLE
+
     if not skill_dirs:
         print(
             f"ori: no skill directories found under {shown(str(target))}. "
@@ -340,7 +381,16 @@ def _run_skills_validate(args: argparse.Namespace) -> int:
                 )
             )
             results.append({"name": skill.name, "status": "valid"})
-        except SkillValidationError as exc:
+        except (SkillValidationError, SkillSecurityError) as exc:
+            human_lines.append(
+                terminal.failure(f"  \u2718 {skill_dir.name}", stream=stream)
+                + f"\n    {exc}"
+            )
+            results.append(
+                {"name": skill_dir.name, "status": "invalid", "error": str(exc)}
+            )
+            failed = True
+        except yaml.YAMLError as exc:
             human_lines.append(
                 terminal.failure(f"  \u2718 {skill_dir.name}", stream=stream)
                 + f"\n    {exc}"
