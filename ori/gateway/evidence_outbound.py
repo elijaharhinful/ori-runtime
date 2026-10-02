@@ -32,7 +32,9 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ori.gateway.mqtt_security import apply_tls_context, parse_gateway_broker_url
+from ori.gateway.route_io import RouteIO, Slots
 from ori.security.evidence.bound import BoundOutboundQueue
+from ori.security.evidence.executor import EvidenceExecutorSaturatedError
 from ori.security.evidence.ledger import (
     FAULT_HOLDER_ENVELOPE,
     FAULT_HOLDER_OBLIGATION,
@@ -91,6 +93,10 @@ RETRY_BACKOFF_MAX_S = 900.0
 DRAIN_BATCH = 50
 _RECONNECT_MIN_S = 5.0
 _RECONNECT_MAX_S = 300.0
+_SHUTDOWN_DRAIN_S = 5.0
+#: Acknowledgements being applied at once. Past it one is dropped; the
+#: artifact stays retained and its next attempt draws another.
+ACK_IN_FLIGHT_BOUND = 16
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -327,6 +333,10 @@ class MqttEvidenceOutboundPublisher:
         self._wake: asyncio.Event | None = None
         self._drain_lock = asyncio.Lock()
         self._published = 0
+        self._io = RouteIO("ori-evidence-out")
+        # Taken in the client's callback thread, before anything is scheduled.
+        self._ack_slots = Slots(ACK_IN_FLIGHT_BOUND)
+        self._acks_shed = 0
 
     @property
     def topic(self) -> str:
@@ -355,6 +365,13 @@ class MqttEvidenceOutboundPublisher:
         self._lost = asyncio.Event()
         self._granted = asyncio.Event()
         self._wake = asyncio.Event()
+        self._io.open()
+        try:
+            await self._serve(shutdown_event)
+        finally:
+            self._io.shutdown()
+
+    async def _serve(self, shutdown_event: asyncio.Event) -> None:
         delay = _RECONNECT_MIN_S
         while not shutdown_event.is_set():
             try:
@@ -395,10 +412,10 @@ class MqttEvidenceOutboundPublisher:
         if self._broker.username:
             client.username_pw_set(self._broker.username, self._broker.password)
         apply_tls_context(client, self._broker)
-        await asyncio.to_thread(
+        await self._io.run(
             client.connect, self._broker.host, int(self._broker.port), 60
         )
-        await asyncio.to_thread(client.loop_start)
+        await self._io.run(client.loop_start)
         await _wait_first(shutdown_event, lost, granted)
         while not shutdown_event.is_set() and not lost.is_set():
             wake.clear()
@@ -411,15 +428,23 @@ class MqttEvidenceOutboundPublisher:
         if not shutdown_event.is_set():
             raise ConnectionError("subscription lost")
         # Shutting down with the session still granted: carry what was retained
-        # since the last drain before the route is closed.
-        await self.drain()
+        # since the last drain before the route is closed, within a bound, so a
+        # held evidence store cannot hold the shutdown.
+        await self.flush(_SHUTDOWN_DRAIN_S)
 
     async def drain(self) -> int:
         """Publish every retained artifact whose retry is due. Returns the count."""
         # One drain at a time: a nudge and a shutdown flush that overlap would
         # both read the same undue rows and carry each artifact twice.
         async with self._drain_lock:
-            return await self._drain()
+            try:
+                return await self._drain()
+            except EvidenceExecutorSaturatedError:
+                # The worker has all the work it admits; the next cycle retries.
+                logger.warning(
+                    "[evidence-outbound] evidence worker busy; drain deferred"
+                )
+                return 0
 
     async def _drain(self) -> int:
         if not self._connected or self._client is None:
@@ -619,7 +644,7 @@ class MqttEvidenceOutboundPublisher:
             return False
         try:
             payload = carriage_payload(self._device_id, artifact_type, wire)
-            await asyncio.to_thread(client.publish, self.topic, payload, 1)
+            await self._io.run(client.publish, self.topic, payload, 1)
         except Exception:
             logger.warning("[evidence-outbound] failed to publish a %s", artifact_type)
             return False
@@ -632,11 +657,11 @@ class MqttEvidenceOutboundPublisher:
         if client is None:
             return
         try:
-            await asyncio.to_thread(client.loop_stop)
+            await self._io.run(client.loop_stop)
         except Exception:
             logger.warning("[evidence-outbound] failed to stop MQTT loop")
         try:
-            await asyncio.to_thread(client.disconnect)
+            await self._io.run(client.disconnect)
         except Exception:
             logger.warning("[evidence-outbound] failed to disconnect cleanly")
 
@@ -703,11 +728,53 @@ class MqttEvidenceOutboundPublisher:
                 "[evidence-outbound] acknowledgement received before event loop ready"
             )
             return
+        if not self._ack_slots.try_take():
+            # Dropped before anything is scheduled; the artifact stays retained
+            # and its next attempt draws another acknowledgement.
+            self._acks_shed += 1
+            if self._acks_shed == 1 or self._acks_shed % 1000 == 0:
+                logger.warning(
+                    "[evidence-outbound] %d acknowledgements in flight; %d dropped, "
+                    "their artifacts stay retained",
+                    ACK_IN_FLIGHT_BOUND,
+                    self._acks_shed,
+                )
+            return
         payload = getattr(message, "payload", b"") or b""
-        future = asyncio.run_coroutine_threadsafe(self._route_ack(payload), loop)
-        future.add_done_callback(_log_future_failure)
+        started = [False]
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._route_ack(payload, started), loop
+            )
+        except Exception:
+            logger.warning("[evidence-outbound] could not schedule an acknowledgement")
+            self._ack_slots.give_back()
+            return
 
-    async def _route_ack(self, payload: bytes) -> None:
+        def settled(done: Any) -> None:
+            if not started[0]:
+                self._ack_slots.give_back()
+            _log_future_failure(done)
+
+        future.add_done_callback(settled)
+
+    @property
+    def acks_shed(self) -> int:
+        """Acknowledgements dropped at the in-flight bound."""
+        return self._acks_shed
+
+    @property
+    def _acks_in_flight(self) -> int:
+        return self._ack_slots.taken
+
+    async def _route_ack(self, payload: bytes, started: list[bool]) -> None:
+        started[0] = True
+        try:
+            await self._apply_ack(payload)
+        finally:
+            self._ack_slots.give_back()
+
+    async def _apply_ack(self, payload: bytes) -> None:
         routed = await self._router.handle_ack(payload)
         if routed.outcome == ROUTED_REFUSED:
             logger.warning(

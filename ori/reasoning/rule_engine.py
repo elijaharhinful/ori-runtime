@@ -97,6 +97,27 @@ class _CooldownRecord:
     last_fired_ms: int
 
 
+#: Rule selections for :meth:`RuleEngine.evaluate_all`.
+RULES_ALL = "all"
+RULES_TIER_D = "tier_d"
+RULES_OTHER = "other"
+_RULE_SELECTIONS = frozenset({RULES_ALL, RULES_TIER_D, RULES_OTHER})
+
+
+def _is_tier_d(rule: Any) -> bool:
+    return str(_rule_get(rule, "action_tier", "A")).upper() == "D"
+
+
+def _names_history(condition: str) -> bool:
+    try:
+        tree = ast.parse(condition, mode="eval")
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Name) and node.id == "history" for node in ast.walk(tree)
+    )
+
+
 class EvalContext:
     """Thin wrapper that exposes sensor history helpers inside rule expressions.
 
@@ -345,6 +366,8 @@ class RuleEngine:
     def __init__(self) -> None:
         # rule_name → last-fired timestamp
         self._cooldowns: dict[str, _CooldownRecord] = {}
+        # Tier D rules already reported as naming something nothing supplies.
+        self._unresolved_tier_d: set[tuple[str, str]] = set()
 
     @staticmethod
     def _cooldown_key(rule_name: str, scope: str) -> str:
@@ -398,6 +421,8 @@ class RuleEngine:
         context: dict[str, Any] | None = None,
         state_store: Any = None,
         scope: str = "",
+        *,
+        select: str = RULES_ALL,
     ) -> list[RuleResult]:
         """Every rule in *rules* that matches *event*, in declaration order.
 
@@ -417,6 +442,11 @@ class RuleEngine:
                 and ``sensor_type`` are always injected from the event.
             state_store: Optional :class:`~ori.state.store.StateStore` instance
                 passed to :class:`EvalContext` for history helpers.
+            select: Which rules this call evaluates. ``RULES_TIER_D`` takes the
+                Tier D rules and reads no history, so nothing a Tier D
+                condition decides waits on a store read made for another rule;
+                ``RULES_OTHER`` takes the rest, prefetching only what they name.
+                The caller supplies a Tier D context without hook output.
 
         Returns:
             Every matching :class:`RuleResult`. An empty list means no rule
@@ -453,15 +483,28 @@ class RuleEngine:
             base_ctx["unit"] = event.reading.unit
             base_ctx["quality"] = event.reading.quality
 
+        if select not in _RULE_SELECTIONS:
+            raise ValueError(f"unknown rule selection {select!r}")
+        # Every rule is checked whichever are evaluated, so a forbidden
+        # condition refuses the skill the same way in each selection.
+        history_calls_by_rule: list[list[tuple[str, list[Any]]]] = []
+        for rule in rules:
+            check_condition = _rule_get(rule, "condition", "")
+            if check_condition:
+                _check_safety_ast(check_condition)
+                history_calls_by_rule.append(_extract_history_calls(check_condition))
+            else:
+                history_calls_by_rule.append([])
+        selected = [
+            (rule, calls)
+            for rule, calls in zip(rules, history_calls_by_rule)
+            if select == RULES_ALL or (_is_tier_d(rule) == (select == RULES_TIER_D))
+        ]
+
         # Pre-fetch history if needed to safely inject into synchronous eval.
         history_cache: dict[tuple, Any] = {}
-        for rule in rules:
-            prefetch_condition = _rule_get(rule, "condition", "")
-            if not prefetch_condition:
-                continue
-            _check_safety_ast(prefetch_condition)
-            history_calls = _extract_history_calls(prefetch_condition)
-            if state_store is None:
+        for rule, history_calls in selected:
+            if state_store is None or _is_tier_d(rule):
                 continue
             for method, args in history_calls:
                 if method == "avg_24h":
@@ -504,7 +547,7 @@ class RuleEngine:
         namespace = eval_ctx.as_dict()
 
         matches: list[RuleResult] = []
-        for rule in rules:
+        for rule, _calls in selected:
             name: str = _rule_get(rule, "name", "<unnamed>")
             condition: str = _rule_get(rule, "condition", "")
             bypass_llm: bool = bool(_rule_get(rule, "bypass_llm", False))
@@ -518,6 +561,16 @@ class RuleEngine:
             if not condition:
                 continue
 
+            if action_tier.upper() == "D" and _names_history(condition):
+                # The loader refuses this skill; refused here too, so a Tier D
+                # cutoff never rests on a history read whatever admitted it.
+                logger.error(
+                    "RuleEngine: Tier D rule %r names history and is not "
+                    "evaluated; a Tier D condition reads the reading in hand only",
+                    name,
+                )
+                continue
+
             try:
                 matched = _eval_checked_condition(condition, namespace)
             except NameError as exc:
@@ -525,6 +578,21 @@ class RuleEngine:
                 # The runtime evaluates all triggers on every event; sensors not
                 # included in the current reading will always produce NameError.
                 # Log at DEBUG — this is not an error, it is a skip.
+                if action_tier.upper() == "D" and select == RULES_TIER_D:
+                    # A Tier D condition sees the reading and the skill's own
+                    # configuration, never a hook's output: a name only a hook
+                    # supplies is refused here, as the loader refuses it.
+                    if (scope, name) not in self._unresolved_tier_d:
+                        self._unresolved_tier_d.add((scope, name))
+                        logger.warning(
+                            "RuleEngine: Tier D rule %r of %r is not evaluated: %s; "
+                            "a Tier D condition reads the reading and the skill's "
+                            "configuration only",
+                            name,
+                            scope,
+                            exc,
+                        )
+                    continue
                 logger.debug(
                     "RuleEngine: skipping rule %r — sensor not in event (%s)",
                     name,

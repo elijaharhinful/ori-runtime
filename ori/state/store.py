@@ -2,13 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import contextlib
 import datetime
+import functools
 import hashlib
 import json
 import logging
 import math
 import os
 import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Concatenate, Optional, ParamSpec, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1138,6 +1143,14 @@ HISTORY_ADMISSION_CEILING = 1024
 #: the writer. A write still in flight then has the writer's own grace, the
 #: store's busy timeout, so a close under a held lock takes several seconds.
 HISTORY_DRAIN_S = 2.0
+#: Threads serving reads; each opens its own short-lived connection.
+_READ_WORKERS = 4
+#: How long a skill hook's store call waits on a lock. Hooks run on the event
+#: loop, so this is how long a hook can hold it; past it the call fails.
+HOOK_BUSY_TIMEOUT_S = 0.05
+#: After a hook's store call meets a lock, how long further hook calls fail at
+#: once rather than each waiting out the timeout again.
+HOOK_BUSY_BACKOFF_S = 1.0
 
 
 class StateStore:
@@ -1173,6 +1186,21 @@ class StateStore:
         # order, so every row at or below it was committed before it was read.
         self._history_frontier = 0
         self._history_writer = self._new_history_writer()
+        # The store's own threads. On the loop's default executor, anything
+        # else that blocks a thread there -- a gateway route, a library call --
+        # would queue an approval commit or a history read behind it. Writes
+        # are serialised by the write lock, so one thread serves them, and a
+        # flood of reads cannot take it.
+        self._write_executor: ThreadPoolExecutor | None = None
+        self._read_executor: ThreadPoolExecutor | None = None
+        self._read_admission: asyncio.Semaphore | None = None
+        # Skill hooks' own connections, one per calling thread (the hook
+        # thread, and the loop for prompt history): never the writer's, each
+        # used only by the thread that opened it, with a short busy timeout.
+        self._hook_local = threading.local()
+        self._hook_conns: list[tuple[threading.Thread, sqlite3.Connection]] = []
+        self._hook_lock = threading.Lock()
+        self._hook_busy_until = 0.0
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -1181,9 +1209,9 @@ class StateStore:
         async with self._lifecycle_lock:
             if self._conn is not None:
                 return
-            conn = await asyncio.to_thread(self._open_sync)
+            conn = await self._on_writer(self._open_sync)
             if not self._read_only:
-                self._history_frontier = await asyncio.to_thread(
+                self._history_frontier = await self._on_writer(
                     self._history_sequence_sync, conn
                 )
             if self._history_writer.closed:
@@ -1254,7 +1282,22 @@ class StateStore:
                 conn = self._conn
                 self._conn = None
             if conn is not None:
-                await asyncio.to_thread(conn.close)
+                await self._on_writer(conn.close)
+            # A read still in flight finishes on its own thread; nothing waits.
+            for executor in (self._write_executor, self._read_executor):
+                if executor is not None:
+                    executor.shutdown(wait=False)
+            self._write_executor = self._read_executor = None
+            self._read_admission = None
+            with self._hook_lock:
+                hook_conns, self._hook_conns = self._hook_conns, []
+                self._hook_local = threading.local()
+            for owner, hook_conn in hook_conns:
+                # A hook abandoned mid-call still holds its connection; it is
+                # left to the abandoned thread rather than closed under it.
+                if owner is threading.current_thread() or not owner.is_alive():
+                    with contextlib.suppress(sqlite3.Error):
+                        hook_conn.close()
 
     def _migrate_sync(self, conn: sqlite3.Connection) -> None:
         conn.executescript(_CORE_DDL)
@@ -1921,7 +1964,7 @@ class StateStore:
         if self._read_only:
             raise PermissionError("this store was opened read-only")
         async with self._write_lock:
-            return await asyncio.to_thread(fn, *args, **kwargs)
+            return await self._on_writer(fn, *args, **kwargs)
 
     async def _run_read(
         self,
@@ -1942,7 +1985,30 @@ class StateStore:
         def call_with_conn() -> _T:
             return self._run_read_with_conn(fn, *args, **kwargs)
 
-        return await asyncio.to_thread(call_with_conn)
+        if self._read_executor is None:
+            self._read_executor = ThreadPoolExecutor(
+                max_workers=_READ_WORKERS, thread_name_prefix="ori-store-read"
+            )
+        # Admission, not a queue: no more reads are handed to the pool than it
+        # has threads, and the rest wait here holding nothing.
+        if self._read_admission is None:
+            self._read_admission = asyncio.Semaphore(_READ_WORKERS)
+        async with self._read_admission:
+            return await asyncio.get_running_loop().run_in_executor(
+                self._read_executor, call_with_conn
+            )
+
+    async def _on_writer(
+        self, fn: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs
+    ) -> _T:
+        """Run *fn* on the store's write thread, never the loop's default pool."""
+        if self._write_executor is None:
+            self._write_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ori-store-write"
+            )
+        return await asyncio.get_running_loop().run_in_executor(
+            self._write_executor, functools.partial(fn, *args, **kwargs)
+        )
 
     def _run_read_on_primary_conn(
         self,
@@ -1986,6 +2052,55 @@ class StateStore:
             f"{path.resolve().as_uri()}?mode={mode}", uri=True, check_same_thread=False
         )
         conn.row_factory = sqlite3.Row
+        return conn
+
+    def _run_hook(
+        self,
+        fn: Callable[Concatenate[sqlite3.Connection, _P], _T],
+        *args: _P.args,
+        **kwargs: _P.kwargs,
+    ) -> _T:
+        """Run a skill hook's store call on the hooks' own connection.
+
+        Hooks run synchronously on the event loop, so a call here must not wait
+        out the store's ordinary busy timeout, and must never touch the
+        writer's connection, whose transactions it would otherwise commit in
+        the middle of. A locked store fails the call within
+        ``HOOK_BUSY_TIMEOUT_S``, and the calls after it fail at once for
+        ``HOOK_BUSY_BACKOFF_S``.
+        """
+        if self._db_path == ":memory:" or self._read_only:
+            conn, close_when_done = self._open_read_conn_sync()
+            try:
+                return fn(conn, *args, **kwargs)
+            finally:
+                if close_when_done:
+                    conn.close()
+        if time.monotonic() < self._hook_busy_until:
+            raise sqlite3.OperationalError(
+                "database is locked; hook store access is deferred"
+            )
+        conn = self._hook_connection()
+        try:
+            return fn(conn, *args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc) or "busy" in str(exc):
+                self._hook_busy_until = time.monotonic() + HOOK_BUSY_BACKOFF_S
+            with contextlib.suppress(sqlite3.Error):
+                conn.rollback()
+            raise
+
+    def _hook_connection(self) -> sqlite3.Connection:
+        """This thread's hook connection, opened on first use by this thread."""
+        conn: sqlite3.Connection | None = getattr(self._hook_local, "conn", None)
+        if conn is None:
+            # Thread affinity is enforced by sqlite3 itself: a connection
+            # used from any thread but its opener raises ProgrammingError.
+            conn = sqlite3.connect(self._db_path, timeout=HOOK_BUSY_TIMEOUT_S)
+            conn.row_factory = sqlite3.Row
+            self._hook_local.conn = conn
+            with self._hook_lock:
+                self._hook_conns.append((threading.current_thread(), conn))
         return conn
 
     def _open_read_conn_sync(self) -> tuple[sqlite3.Connection, bool]:
@@ -2245,9 +2360,7 @@ class StateStore:
         self, sensor_id: str, limit: int = 100, *, frontier: int | None = None
     ) -> list[StoredReading]:
         """Stable sync facade for hook history lookups."""
-        return self._run_read_with_conn(
-            self._get_history_sync, sensor_id, limit, frontier
-        )
+        return self._run_hook(self._get_history_sync, sensor_id, limit, frontier)
 
     def _get_history_sync(
         self,
@@ -2279,7 +2392,7 @@ class StateStore:
         self, sensor_id: str, n: int, *, frontier: int | None = None
     ) -> Optional[float]:
         """Stable sync facade for hook rolling-N average lookups."""
-        return self._run_read_with_conn(self._avg_last_n_sync, sensor_id, n, frontier)
+        return self._run_hook(self._avg_last_n_sync, sensor_id, n, frontier)
 
     def _avg_last_n_sync(
         self,
@@ -2315,9 +2428,7 @@ class StateStore:
         self, sensor_id: str, hours: int, *, frontier: int | None = None
     ) -> Optional[float]:
         """Stable sync facade for hook average-over-hours lookups."""
-        return self._run_read_with_conn(
-            self._avg_last_hours_sync, sensor_id, hours, frontier
-        )
+        return self._run_hook(self._avg_last_hours_sync, sensor_id, hours, frontier)
 
     def _avg_last_hours_sync(
         self,
@@ -2405,7 +2516,7 @@ class StateStore:
         min_weeks: int = 3,
     ) -> dict[str, Any]:
         """Stable sync facade for hook site-local baseline lookups."""
-        return self._run_read_with_conn(
+        return self._run_hook(
             self._time_of_week_baseline_sync,
             sensor_id,
             reference_timestamp_ms,
@@ -7937,7 +8048,7 @@ class StateStore:
 
     def hooks_get_skill_state(self, skill_name: str, key: str) -> Optional[str]:
         """Stable sync facade for hook skill-state reads."""
-        return self._run_read_with_conn(self._get_skill_state_sync, skill_name, key)
+        return self._run_hook(self._get_skill_state_sync, skill_name, key)
 
     def _get_skill_state_sync(
         self, conn: sqlite3.Connection, skill_name: str, key: str
@@ -7955,12 +8066,18 @@ class StateStore:
         await self._run_write(self._set_skill_state_sync, skill_name, key, value)
 
     def hooks_set_skill_state(self, skill_name: str, key: str, value: str) -> None:
-        """Stable sync facade for hook skill-state writes."""
-        self._set_skill_state_sync(skill_name, key, value)
+        """Stable sync facade for hook skill-state writes, on the hooks' connection."""
+        self._run_hook(self._set_skill_state_on, skill_name, key, value)
 
     def _set_skill_state_sync(self, skill_name: str, key: str, value: str) -> None:
         assert self._conn is not None
-        self._conn.execute(
+        self._set_skill_state_on(self._conn, skill_name, key, value)
+
+    @staticmethod
+    def _set_skill_state_on(
+        conn: sqlite3.Connection, skill_name: str, key: str, value: str
+    ) -> None:
+        conn.execute(
             """
             INSERT INTO skill_state (skill_name, key, value, updated_at)
             VALUES (?, ?, ?, ?)
@@ -7970,7 +8087,7 @@ class StateStore:
             """,
             (skill_name, key, value, now_ms()),
         )
-        self._conn.commit()
+        conn.commit()
 
 
 TRIP_JOURNAL_COLUMNS = (

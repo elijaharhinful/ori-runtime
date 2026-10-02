@@ -82,6 +82,18 @@ class BoundIngestService:
     def accept_disposition(self, artifact: object) -> IngestOutcome:
         return self._executor.run(self._service.accept_disposition, artifact)
 
+    async def accept_async(self, artifact_type: str, artifact: object) -> IngestOutcome:
+        """Apply one artifact without holding a thread outside the evidence worker.
+
+        *artifact_type* is one of ``custody``, ``receipt`` or ``epoch``.
+        """
+        handler = {
+            "custody": self._service.accept_custody,
+            "receipt": self._service.accept_receipt,
+            "epoch": self._service.accept_epoch_confirmation,
+        }[artifact_type]
+        return await self._executor.run_async(handler, artifact)
+
     @property
     def rejections(self) -> tuple[IngestOutcome, ...]:
         return self._executor.run(lambda: self._service.rejections)
@@ -286,3 +298,9 @@ class ExecutorBoundConfirmationBackend:
 
     def active_anchor_epoch_id(self, device_id: str) -> str | None:
         return self._executor.run(self._reader.active_anchor_epoch_id, device_id)
+
+    async def active_anchor_epoch_id_async(self, device_id: str) -> str | None:
+        """The same read, awaited without holding a thread outside the worker."""
+        return await self._executor.run_async(
+            self._reader.active_anchor_epoch_id, device_id
+        )

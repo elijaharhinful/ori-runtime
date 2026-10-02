@@ -245,8 +245,10 @@ DISCOVERY BARRIER — one event, every eligible skill, evaluated exhaustively
     Eligible means the skill declares this reading's sensor type; the bus was
     that boundary before, and dropping it let a current or gas condition match
     an unrelated channel. Every trigger whose condition holds is collected,
-    across those skills, before any action is dispatched and before any
-    reasoning is scheduled.
+    across those skills, before any reasoning is scheduled. Tier D conditions
+    read the reading and the skill's configuration only, so they are decided
+    and their acts attempted before any hook runs or any history is read; the
+    loader refuses a Tier D condition naming anything else.
     Declaration order decides nothing. A trigger in cooldown does not match,
     and neither does one with a cooldown whose own plan is still in flight —
     except a plan granting Tier D, which is never held; cooldown is charged
@@ -982,7 +984,7 @@ The dispatcher is called after every reasoning result. It MUST:
 2. Use asyncio.wait_for() with timeout for approval responses
 3. Always produce an ActionResult, even on failure
 4. Log every action attempt to the action_log table in SQLite — after the act,
-   never ahead of it. Records of Tier C/D acts and operator decisions go
+   never ahead of it. Records of every act and of operator decisions go
    through one ordered, bounded writer that retries a locked store;
    a record past the ceiling, refused outright, or still unwritten at shutdown
    is counted lost and reported, never waited for. A process that dies before

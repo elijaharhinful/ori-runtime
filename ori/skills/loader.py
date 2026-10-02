@@ -26,7 +26,9 @@ import base64
 import binascii
 import errno
 import importlib.util
+import inspect
 import logging
+import math
 import os
 import re
 import stat
@@ -87,6 +89,63 @@ def _refuse_history_in_tier_d_condition(
                 "not depend on delivery order or on how current the store believes "
                 "a reading is. This guard reads the condition text only; it does not "
                 "see a hook, a prompt, or what an executor reads."
+            )
+
+
+def _refuse_unresolved_names_in_tier_d_condition(
+    skill_name: str,
+    trigger_name: str,
+    condition: str,
+    config: dict[str, Any],
+) -> None:
+    """A Tier D condition may name only the reading and the skill's own configuration.
+
+    An allowlist, not a search for what a hook might write: that is all the
+    rule engine gives a Tier D condition, before any hook runs. A configured
+    value it names must be a finite number, since nothing coerces it.
+    """
+    try:
+        tree = ast.parse(condition, mode="eval")
+    except SyntaxError:
+        return
+    named = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    unresolved = sorted(named - RESERVED_CONTEXT_NAMES - set(config) - {"history"})
+    if unresolved:
+        raise SkillValidationError(
+            f"Skill '{skill_name}' trigger '{trigger_name}' is Tier D and its "
+            f"condition names {unresolved}, which neither the reading nor the "
+            "skill's configuration supplies. A Tier D condition is decided from "
+            "the reading and the skill's configuration before any hook runs, so "
+            "a hook can neither delay nor decide it."
+        )
+    for name in sorted(named & set(config)):
+        value = config[name]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise SkillValidationError(
+                f"Skill '{skill_name}' trigger '{trigger_name}' is Tier D and its "
+                f"condition reads config {name!r} = {value!r}, which is not a "
+                "finite number; a Tier D input is compared as configured."
+            )
+
+
+def _refuse_asynchronous_hooks(skill_name: str, hooks: Any) -> None:
+    """Hooks are synchronous: they run on the hook thread, never the event loop.
+
+    A coroutine function would hand its body back to the loop to run, where
+    synchronous work before its first await holds every reading behind it.
+    """
+    if hooks is None:
+        return
+    for name in ("pre_trigger_eval", "post_reasoning"):
+        fn = getattr(hooks, name, None)
+        if fn is not None and inspect.iscoroutinefunction(fn):
+            raise SkillValidationError(
+                f"Skill '{skill_name}' hook {name} is asynchronous; skill hooks "
+                "must be synchronous functions, run on the hook thread."
             )
 
 
@@ -899,9 +958,19 @@ class SkillLoader:
             raw.get("config") or {},
             raw.get("name", "<unknown>"),
         )
+        config = raw.get("config")
+        for trigger in triggers:
+            if trigger.action_tier == "D":
+                _refuse_unresolved_names_in_tier_d_condition(
+                    raw.get("name", "<unknown>"),
+                    trigger.name,
+                    trigger.condition,
+                    config if isinstance(config, dict) else {},
+                )
         self._verify_community_signature(raw, skill_dir)
         if load_hooks:
             hooks = self._load_hooks(skill_dir)
+            _refuse_asynchronous_hooks(raw.get("name", "<unknown>"), hooks)
         else:
             if enforce_hook_policy:
                 self._assert_hooks_activatable(skill_dir)
