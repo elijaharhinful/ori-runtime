@@ -326,12 +326,14 @@ def _run_skills_validate(args: argparse.Namespace) -> int:
 
     results: list[dict[str, str]] = []
     failed = False
+    human_lines: list[str] = []
+
     for skill_dir in skill_dirs:
         if not (skill_dir / "skill.yaml").exists():
             continue
         try:
             skill = loader.load_one(skill_dir)
-            print(
+            human_lines.append(
                 terminal.success(
                     f"  \u2714 {skill.name} v{skill.version}",
                     stream=stream,
@@ -339,7 +341,7 @@ def _run_skills_validate(args: argparse.Namespace) -> int:
             )
             results.append({"name": skill.name, "status": "valid"})
         except SkillValidationError as exc:
-            print(
+            human_lines.append(
                 terminal.failure(f"  \u2718 {skill_dir.name}", stream=stream)
                 + f"\n    {exc}"
             )
@@ -349,10 +351,7 @@ def _run_skills_validate(args: argparse.Namespace) -> int:
             failed = True
 
     payload = {"results": results}
-    if getattr(args, "json", False):
-        json.dump(payload, sys.stdout, indent=2, sort_keys=True)
-        sys.stdout.write("\n")
-
+    _emit(args, payload, "\n".join(human_lines))
     return EXIT_FAILED if failed else EXIT_OK
 
 
