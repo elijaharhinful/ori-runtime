@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import logging
 import textwrap
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -2038,19 +2039,34 @@ def test_rejects_unknown_keys_in_trigger(tmp_path: Path, bad_key: str) -> None:
     ],
 )
 def test_rejects_unknown_trigger_key_through_load_all(
-    tmp_path: Path, bad_key: str
+    tmp_path: Path, bad_key: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Unknown trigger keys must also surface when discovered via load_all."""
+    """Unknown trigger keys must also surface when discovered via load_all.
+
+    The skill must be absent from the result *because of the bad key*: the
+    logged error message must name it, not some other skip reason such as a
+    quota or duplicate name.  A control pass without the bad key confirms the
+    fixture itself is valid.
+    """
     skill_dir = tmp_path / "bad-skill"
     yaml_text = _minimal_yaml().replace(
         "            action_tier: A",
         f"            action_tier: A\n            {bad_key}: true",
     )
     _write_skill_yaml(skill_dir, yaml_text)
-    # load_all swallows SkillValidationError and skips the skill; the skill
-    # must not appear in the returned list.
-    skills = _first_party_loader().load_all(str(tmp_path))
+
+    with caplog.at_level(logging.ERROR, logger="ori.skills.loader"):
+        skills = _first_party_loader().load_all(str(tmp_path))
+
     assert not any(s.name == "test-skill" for s in skills)
+    # The logged reason must name the offending key so operators can diagnose it.
+    assert bad_key in caplog.text
+
+    # Control: the same fixture without the bad key loads successfully.
+    good_dir = tmp_path / "good-skill"
+    _write_skill_yaml(good_dir, _minimal_yaml())
+    good_skills = _first_party_loader().load_all(str(good_dir.parent))
+    assert any(s.name == "test-skill" for s in good_skills)
 
 
 # -- Action unknown-key tests ------------------------------------------------
@@ -2084,14 +2100,30 @@ def test_rejects_unknown_keys_in_action(tmp_path: Path, bad_key: str) -> None:
     ],
 )
 def test_rejects_unknown_action_key_through_load_all(
-    tmp_path: Path, bad_key: str
+    tmp_path: Path, bad_key: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Unknown action keys must also surface when discovered via load_all."""
+    """Unknown action keys must also surface when discovered via load_all.
+
+    The skill must be absent because of the bad key, not any other reason.
+    The logged error must name the offending key; a control pass confirms the
+    fixture is otherwise valid.
+    """
     skill_dir = tmp_path / "bad-skill"
     yaml_text = _minimal_yaml().replace(
         "- name: alert_whatsapp\n              tier: A",
         f"- name: alert_whatsapp\n              tier: A\n              {bad_key}: false",
     )
     _write_skill_yaml(skill_dir, yaml_text)
-    skills = _first_party_loader().load_all(str(tmp_path))
+
+    with caplog.at_level(logging.ERROR, logger="ori.skills.loader"):
+        skills = _first_party_loader().load_all(str(tmp_path))
+
     assert not any(s.name == "test-skill" for s in skills)
+    # The logged reason must name the offending key so operators can diagnose it.
+    assert bad_key in caplog.text
+
+    # Control: the same fixture without the bad key loads successfully.
+    good_dir = tmp_path / "good-skill"
+    _write_skill_yaml(good_dir, _minimal_yaml())
+    good_skills = _first_party_loader().load_all(str(good_dir.parent))
+    assert any(s.name == "test-skill" for s in good_skills)
