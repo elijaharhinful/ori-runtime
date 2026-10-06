@@ -86,7 +86,7 @@ class _FakeBus:
 
 
 async def _provision(store) -> None:
-    """Register AND approve. Without the approval every message is
+    """Register, approve and confirm. Without the approval every message is
     rejected as ``device_not_approved``, which would make the
     tampered-signature test below pass for the wrong reason."""
     gate = FirmwareTelemetryGate(store)
@@ -99,6 +99,12 @@ async def _provision(store) -> None:
     )
     assert await gate.approve_device(
         manifest["device_id"], actor="test-operator", reason="composition test"
+    )
+    # Liveness, like a command, is signed only under a confirmed epoch; stand
+    # in for the coordinator that confirms it.
+    row = await store.get_firmware_device(manifest["device_id"])
+    await store.resolve_firmware_confirmation(
+        manifest["device_id"], row["anchor_epoch_id"], status="confirmed", at_ms=1
     )
 
 
@@ -227,9 +233,14 @@ async def test_rejected_telemetry_does_not_establish_supervision(store) -> None:
 
 
 class _FakeInfo:
+    """As paho's: the wait returns None, and is_published says whether."""
+
     rc = 0
 
     def wait_for_publish(self, timeout):
+        return None
+
+    def is_published(self):
         return True
 
 
@@ -248,6 +259,9 @@ class _FakeClient:
 
     def connect(self, *a, **k):
         pass
+
+    def is_connected(self):
+        return True
 
     def loop_start(self):
         pass

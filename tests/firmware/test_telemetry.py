@@ -906,6 +906,18 @@ def gate(store):
     return FirmwareTelemetryGate(store)
 
 
+async def _allocate_command_seq(store: StateStore, device_id: str) -> int:
+    """Allocate as a command would: under a confirmed active anchor."""
+    from ori.utils.time_utils import now_ms
+
+    row = await store.get_firmware_device(device_id)
+    assert row is not None
+    await store.resolve_firmware_confirmation(
+        device_id, row["anchor_epoch_id"], status="confirmed", at_ms=now_ms()
+    )
+    return await store.allocate_firmware_command_seq(device_id, verified_against=row)
+
+
 async def provision_and_approve(gate: FirmwareTelemetryGate, manifest_case: str) -> str:
     manifest = CASES[manifest_case]["input"]
     manifest_hash = await gate.register_device(
@@ -1118,7 +1130,11 @@ class TestRegistrationLifecycle:
         await gate.approve_device(DEV_DEVICE, actor="test-operator", reason="test")
         # Actually advance it, so a reset would be visible.
         await gate._store.advance_firmware_freshness(
-            DEV_DEVICE, boot_id=3, seq=99, uptime_ms=0
+            DEV_DEVICE,
+            boot_id=3,
+            seq=99,
+            uptime_ms=0,
+            verified_against=await gate._store.get_firmware_device(DEV_DEVICE),
         )
         row_before = await gate._store.get_firmware_device(DEV_DEVICE)
         assert row_before["last_seq"] == 99
@@ -1186,7 +1202,11 @@ class TestRegistrationLifecycle:
         )
         await gate.approve_device(SEALED_DEVICE, actor="test-operator", reason="test")
         await gate._store.advance_firmware_freshness(
-            SEALED_DEVICE, boot_id=7, seq=1234, uptime_ms=0
+            SEALED_DEVICE,
+            boot_id=7,
+            seq=1234,
+            uptime_ms=0,
+            verified_against=await gate._store.get_firmware_device(SEALED_DEVICE),
         )
         before = await gate._store.get_firmware_device(SEALED_DEVICE)
 
@@ -2257,10 +2277,14 @@ class TestLifecycleSequences:
     async def test_revoked_and_key_changed__all_three_operations(self, gate) -> None:
         await self._registered_and_active(gate)
         # Give the device a command-sequence history to protect.
-        assert await gate._store.allocate_firmware_command_seq(DEV_DEVICE) == 1
-        assert await gate._store.allocate_firmware_command_seq(DEV_DEVICE) == 2
+        assert await _allocate_command_seq(gate._store, DEV_DEVICE) == 1
+        assert await _allocate_command_seq(gate._store, DEV_DEVICE) == 2
         await gate._store.advance_firmware_freshness(
-            DEV_DEVICE, boot_id=4, seq=900, uptime_ms=0
+            DEV_DEVICE,
+            boot_id=4,
+            seq=900,
+            uptime_ms=0,
+            verified_against=await gate._store.get_firmware_device(DEV_DEVICE),
         )
         await gate.revoke_device(DEV_DEVICE, actor="op", reason="key compromised")
 
@@ -2300,7 +2324,7 @@ class TestLifecycleSequences:
         assert row["last_boot_id"] == 0
         assert row["last_seq"] == 0
         # But cmd_seq is per DEVICE, not per key, and must continue.
-        assert await gate._store.allocate_firmware_command_seq(DEV_DEVICE) == 3
+        assert await _allocate_command_seq(gate._store, DEV_DEVICE) == 3
 
         names = [
             t["transition"]
@@ -2321,7 +2345,11 @@ class TestLifecycleSequences:
         # replay window must NOT re-open.
         await self._registered_and_active(gate, "manifest_full_sealed")
         await gate._store.advance_firmware_freshness(
-            SEALED_DEVICE, boot_id=4, seq=900, uptime_ms=0
+            SEALED_DEVICE,
+            boot_id=4,
+            seq=900,
+            uptime_ms=0,
+            verified_against=await gate._store.get_firmware_device(SEALED_DEVICE),
         )
         await gate.register_device(
             device_id=SEALED_DEVICE,
