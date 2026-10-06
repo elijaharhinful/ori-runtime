@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO, Any, Callable, Generator, NoReturn
 
+from ori.security.ed25519_keys import admit_public_key, refused_public_key_clause
+
 SIGNATURE_SCHEMA = "ori.runtime_release_bundle_signature.v1"
 MANIFEST_SCHEMA = "ori.runtime_release_bundle_manifest.v1"
 SIGNATURE_DOMAIN = b"ori.runtime_release_bundle_signature.v1\0"
@@ -166,12 +168,17 @@ def load_release_key_registry(path: str | Path) -> dict[str, ReleaseKey]:
         if status not in {"active", "verify_only", "revoked"}:
             _fail("untrusted_release_key", "release key status is unsupported")
         public_key_b64 = _registry_string(entry, "public_key_b64")
-        _decode_canonical_base64(
+        decoded_key = _decode_canonical_base64(
             public_key_b64,
             label="release public key",
             expected_length=32,
             code="untrusted_release_key",
         )
+        clause = refused_public_key_clause(decoded_key)
+        if clause is not None:
+            _fail(
+                "untrusted_release_key", f"release key {key_id!r} is refused: {clause}"
+            )
         registry[key_id] = ReleaseKey(
             key_id=key_id,
             public_key_b64=public_key_b64,
@@ -333,11 +340,18 @@ def verify_release_bundle(
         code="untrusted_release_key",
     )
     try:
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-            Ed25519PublicKey,
-        )
-
-        Ed25519PublicKey.from_public_bytes(public_key).verify(
+        verifier = admit_public_key(public_key)
+    except ImportError as exc:
+        raise ReleaseBundleError(
+            "crypto_unavailable",
+            "cryptography Ed25519 support is unavailable",
+        ) from exc
+    except ValueError as exc:
+        raise ReleaseBundleError(
+            "untrusted_release_key", f"release key {key_id!r} is refused: {exc}"
+        ) from exc
+    try:
+        verifier.verify(
             signature,
             canonical_signature_message(envelope),
         )
