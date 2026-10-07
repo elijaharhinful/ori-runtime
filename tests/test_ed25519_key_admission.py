@@ -829,3 +829,501 @@ def test_every_keyless_signature_is_refused_for_its_key(case: dict[str, str]) ->
     with pytest.raises(RefusedPublicKeyError) as refused:
         admit_public_key(bytes.fromhex(case["public_key_hex"]))
     assert refused.value.clause == CLAUSE_SMALL_ORDER
+
+
+# --- mixed order: a prime-order key shifted by a point of small order ---------
+#
+# The shifted key's holder is the unshifted key's: signing with that scalar and
+# the shifted key in the challenge verifies cofactorlessly whenever the
+# challenge is a multiple of 8. The forgeries below are for the library, which
+# reduces the challenge modulo L; RFC 8032 section 5.1.7 uses the full hash. So a check that knows a key by its bytes (a
+# published key, a collision, a key not to be reused) is passed by shifting.
+# The arithmetic below is affine and shares nothing with ori.security.
+
+_Q = 2**255 - 19
+_CURVE_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
+_ORDER = 2**252 + 27742317777372353535851937790883648493
+ORDER_8 = bytes.fromhex(
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"
+)
+
+
+def _affine(raw: bytes) -> tuple[int, int]:
+    n = int.from_bytes(raw, "little")
+    sign, y = n >> 255, n & ((1 << 255) - 1)
+    xx = (y * y - 1) * pow(_CURVE_D * y * y + 1, _Q - 2, _Q) % _Q
+    x = pow(xx, (_Q + 3) // 8, _Q)
+    if (x * x - xx) % _Q:
+        x = x * pow(2, (_Q - 1) // 4, _Q) % _Q
+    return ((_Q - x) % _Q if x & 1 != sign else x, y)
+
+
+def _affine_add(a: tuple[int, int], b: tuple[int, int]) -> tuple[int, int]:
+    (x1, y1), (x2, y2) = a, b
+    t = _CURVE_D * x1 * x2 * y1 * y2 % _Q
+    return (
+        (x1 * y2 + x2 * y1) * pow(1 + t, _Q - 2, _Q) % _Q,
+        (y1 * y2 + x1 * x2) * pow(1 - t, _Q - 2, _Q) % _Q,
+    )
+
+
+def _affine_mul(k: int, point: tuple[int, int]) -> tuple[int, int]:
+    result = (0, 1)
+    while k:
+        if k & 1:
+            result = _affine_add(result, point)
+        point = _affine_add(point, point)
+        k >>= 1
+    return result
+
+
+def _encode(point: tuple[int, int]) -> bytes:
+    return (point[1] | ((point[0] & 1) << 255)).to_bytes(32, "little")
+
+
+def _shifted(seed: bytes) -> bytes:
+    """The seed's public key plus a point of order 8: mixed order."""
+    public = (
+        Ed25519PrivateKey.from_private_bytes(seed)
+        .public_key()
+        .public_bytes(Encoding.Raw, PublicFormat.Raw)
+    )
+    return _encode(_affine_add(_affine(public), _affine(ORDER_8)))
+
+
+def _forge_under_shift(seed: bytes, message: bytes) -> bytes:
+    """A signature by *seed*'s scalar that the library verifies under its shifted key."""
+    digest = hashlib.sha512(seed).digest()
+    scalar = int.from_bytes(digest[:32], "little") & ((1 << 254) - 8) | (1 << 254)
+    shifted = _shifted(seed)
+    base = _affine(BASE_POINT)
+    for counter in range(512):
+        r = (
+            int.from_bytes(
+                hashlib.sha512(
+                    digest[32:] + message + counter.to_bytes(4, "little")
+                ).digest(),
+                "little",
+            )
+            % _ORDER
+        )
+        big_r = _encode(_affine_mul(r, base))
+        k = (
+            int.from_bytes(hashlib.sha512(big_r + shifted + message).digest(), "little")
+            % _ORDER
+        )
+        if k % 8 == 0:
+            return big_r + ((r + k * scalar) % _ORDER).to_bytes(32, "little")
+    raise AssertionError("no nonce gave a challenge divisible by 8")
+
+
+def _library_accepts_signature(
+    public_key: bytes, signature: bytes, message: bytes
+) -> bool:
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, message)
+    except Exception:
+        return False
+    return True
+
+
+def test_a_shifted_published_key_is_refused_though_its_seed_signs_under_it() -> None:
+    from ori.security.config_signatures import (
+        ConfigSignatureError,
+        _verify_ed25519_signature,
+    )
+    from ori.security.ed25519_keys import CLAUSE_MIXED_ORDER
+    from ori.security.published_test_keys import (
+        PUBLISHED_TEST_KEYS,
+        is_published_seed,
+    )
+
+    published_seed = bytes(32)
+    assert is_published_seed(published_seed)
+    shifted = _shifted(published_seed)
+    payload = b"config"
+    forged = _forge_under_shift(published_seed, payload)
+    # The published set knows keys by their bytes, and the library verifies.
+    assert shifted not in PUBLISHED_TEST_KEYS
+    assert _library_accepts_signature(shifted, forged, payload)
+    assert refused_public_key_clause(shifted) == CLAUSE_MIXED_ORDER
+    with pytest.raises(ConfigSignatureError, match="trust anchor is refused"):
+        _verify_ed25519_signature(
+            signature="ed25519:" + _b64(forged),
+            public_key_b64=_b64(shifted),
+            payload=payload,
+            anchor_env="ORI_CONFIG_TRUST_ANCHOR_PUBLIC_KEY_B64",
+        )
+
+
+def test_one_key_cannot_be_both_anchors_by_shifting_one_of_them() -> None:
+    from ori.security.commissioning.anchors import (
+        AnchorError,
+        _decode_anchor,
+        anchor_collision,
+        load_commissioning_anchors,
+        provisioning_anchor,
+    )
+    from ori.security.ed25519_keys import CLAUSE_MIXED_ORDER
+
+    _, honest = _honest()
+    shifted = _shifted(HONEST_SEED)
+    assert shifted != honest and _library_accepts_signature(
+        shifted, _forge_under_shift(HONEST_SEED, b"binding"), b"binding"
+    )
+    security = {"config_signature": {"trust_anchor_env": "ORI_PROVISIONING_ANCHOR"}}
+    env = {
+        "ORI_COMMISSIONING_ANCHOR_PUBLIC_KEY_B64": _b64(honest),
+        "ORI_PROVISIONING_ANCHOR": _b64(shifted),
+    }
+    # Compared as bytes the two anchors differ, so the shift must be refused
+    # where each anchor is read, not left to the comparison.
+    assert provisioning_anchor(security, env) is None
+    with pytest.raises(AnchorError, match=CLAUSE_MIXED_ORDER):
+        _decode_anchor("ORI_COMMISSIONING_ANCHOR_PUBLIC_KEY_B64", _b64(shifted))
+    anchors = load_commissioning_anchors(env)
+    assert anchor_collision(anchors, honest)
+
+
+async def test_a_rotated_away_key_cannot_return_shifted(tmp_path: Path) -> None:
+    from ori.security.firmware.ingest import FirmwareTelemetryGate
+    from ori.security.firmware.telemetry import (
+        FirmwareVerificationError,
+        canonical_json_bytes,
+        key_epoch_id,
+    )
+    from ori.state.store import StateStore
+    from tests.firmware.test_telemetry import (
+        GOLDEN_SEED,
+        PUBLIC_KEY_B64,
+        SEALED_DEVICE,
+        provision_and_approve,
+        signed_manifest_for_key,
+    )
+
+    sealed = {
+        "posture": "sealed_flash",
+        "secure_boot_enabled": True,
+        "flash_encryption_enabled": True,
+        "key_storage": "efuse_derived",
+    }
+    store = StateStore(db_path=str(tmp_path / "state.db"))
+    await store.open()
+    try:
+        gate = FirmwareTelemetryGate(store)
+        await provision_and_approve(gate, "manifest_full_sealed")
+        rotated = signed_manifest_for_key(
+            bytes([0x55]) * 32, device_id=SEALED_DEVICE, **sealed
+        )
+        await gate.reprovision_device(
+            device_id=SEALED_DEVICE,
+            public_key_b64=rotated["public_key_b64"],
+            posture="sealed_flash",
+            manifest_message=rotated,
+            actor="op",
+            reason="key compromised",
+        )
+        assert await gate.approve_device(SEALED_DEVICE, actor="op", reason="rotation")
+
+        # The compromised key, shifted: a new key epoch to the reuse check.
+        shifted = _shifted(GOLDEN_SEED)
+        assert key_epoch_id(device_id=SEALED_DEVICE, public_key_b64=_b64(shifted)) != (
+            key_epoch_id(device_id=SEALED_DEVICE, public_key_b64=PUBLIC_KEY_B64)
+        )
+        manifest = dict(rotated["manifest"], public_key_b64=_b64(shifted))
+        canonical = canonical_json_bytes(manifest)
+        forged = _forge_under_shift(GOLDEN_SEED, canonical)
+        assert _library_accepts_signature(shifted, forged, canonical)
+        message = {
+            "manifest": manifest,
+            "manifest_hash": "sha256:" + hashlib.sha256(canonical).hexdigest(),
+            "signature": "ed25519:" + _b64(forged),
+        }
+        with pytest.raises(FirmwareVerificationError):
+            await gate.reprovision_device(
+                device_id=SEALED_DEVICE,
+                public_key_b64=_b64(shifted),
+                posture="sealed_flash",
+                manifest_message=message,
+                actor="op",
+                reason="return the old key",
+            )
+        assert await store.get_pending_firmware_anchor(SEALED_DEVICE) is None
+        row = await store.get_firmware_device(SEALED_DEVICE)
+        assert row is not None and row["public_key_b64"] == rotated["public_key_b64"]
+    finally:
+        await store.close()
+
+
+# --- negation: the same holder's key under the other sign of x ---------------
+#
+# -A has prime order, so admission refuses nothing about it, and the holder of
+# a signs under it with -a every time. A check that recognises a key compares
+# its identity, y with the sign bit cleared, never its encoding.
+
+
+def _negated(public_key: bytes) -> bytes:
+    return public_key[:31] + bytes([public_key[31] ^ 0x80])
+
+
+def _sign_under_negation(seed: bytes, message: bytes) -> tuple[bytes, bytes]:
+    """The negated key, and a signature by -a that the library verifies under it."""
+    public = (
+        Ed25519PrivateKey.from_private_bytes(seed)
+        .public_key()
+        .public_bytes(Encoding.Raw, PublicFormat.Raw)
+    )
+    negated = _negated(public)
+    digest = hashlib.sha512(seed).digest()
+    scalar = int.from_bytes(digest[:32], "little") & ((1 << 254) - 8) | (1 << 254)
+    r = (
+        int.from_bytes(hashlib.sha512(digest[32:] + message).digest(), "little")
+        % _ORDER
+    )
+    big_r = _encode(_affine_mul(r, _affine(BASE_POINT)))
+    k = int.from_bytes(hashlib.sha512(big_r + negated + message).digest(), "little")
+    s = (r + k * (-scalar)) % _ORDER
+    return negated, big_r + s.to_bytes(32, "little")
+
+
+def test_a_negated_published_key_is_refused_though_its_seed_signs_under_it() -> None:
+    from ori.security.config_signatures import (
+        ConfigSignatureError,
+        _verify_ed25519_signature,
+    )
+    from ori.security.published_test_keys import PUBLISHED_TEST_KEYS
+
+    payload = b"config"
+    negated, signature = _sign_under_negation(bytes(32), payload)
+    assert refused_public_key_clause(negated) is None
+    assert _library_accepts_signature(negated, signature, payload)
+    assert negated in PUBLISHED_TEST_KEYS
+    with pytest.raises(ConfigSignatureError):
+        _verify_ed25519_signature(
+            signature="ed25519:" + _b64(signature),
+            public_key_b64=_b64(negated),
+            payload=payload,
+            anchor_env="ORI_CONFIG_TRUST_ANCHOR_PUBLIC_KEY_B64",
+        )
+
+
+def test_every_published_key_is_refused_under_both_signs() -> None:
+    from ori.security.published_test_keys import (
+        PUBLISHED_TEST_KEYS,
+        PUBLISHED_TEST_KEYS_B64,
+    )
+
+    for key_b64 in PUBLISHED_TEST_KEYS_B64:
+        raw = base64.b64decode(key_b64)
+        assert raw in PUBLISHED_TEST_KEYS and _negated(raw) in PUBLISHED_TEST_KEYS
+
+
+def test_a_negated_anchor_is_the_same_anchor() -> None:
+    from ori.security.commissioning.anchors import (
+        AnchorError,
+        anchor_collision,
+        load_commissioning_anchors,
+        provisioning_anchor,
+    )
+
+    _, honest = _honest()
+    negated, _ = _sign_under_negation(HONEST_SEED, b"binding")
+    env = {
+        "ORI_COMMISSIONING_ANCHOR_PUBLIC_KEY_B64": _b64(honest),
+        "ORI_PROVISIONING_ANCHOR": _b64(negated),
+    }
+    security = {"config_signature": {"trust_anchor_env": "ORI_PROVISIONING_ANCHOR"}}
+    provisioning = provisioning_anchor(security, env)
+    assert provisioning == negated
+    assert anchor_collision(load_commissioning_anchors(env), provisioning)
+    with pytest.raises(AnchorError, match="rotation demotes a key"):
+        load_commissioning_anchors(
+            {
+                "ORI_COMMISSIONING_ANCHOR_PUBLIC_KEY_B64": _b64(honest),
+                "ORI_COMMISSIONING_ANCHOR_PREVIOUS_PUBLIC_KEY_B64": _b64(negated),
+            }
+        )
+
+
+async def test_a_rotated_away_or_current_key_cannot_return_negated(
+    tmp_path: Path,
+) -> None:
+    from ori.security.firmware.ingest import FirmwareTelemetryGate
+    from ori.security.firmware.telemetry import (
+        ERR_KEY_EPOCH_REUSED,
+        ERR_SAME_KEY_NOT_A_ROTATION,
+        FirmwareVerificationError,
+        canonical_json_bytes,
+    )
+    from ori.state.store import StateStore
+    from tests.firmware.test_telemetry import (
+        GOLDEN_SEED,
+        SEALED_DEVICE,
+        provision_and_approve,
+        signed_manifest_for_key,
+    )
+
+    sealed = {
+        "posture": "sealed_flash",
+        "secure_boot_enabled": True,
+        "flash_encryption_enabled": True,
+        "key_storage": "efuse_derived",
+    }
+    rotated_seed = bytes([0x55]) * 32
+
+    def negated_manifest(seed: bytes, template: dict) -> tuple[str, dict]:
+        negated, _ = _sign_under_negation(seed, b"")
+        manifest = dict(template["manifest"], public_key_b64=_b64(negated))
+        canonical = canonical_json_bytes(manifest)
+        _, signature = _sign_under_negation(seed, canonical)
+        assert _library_accepts_signature(negated, signature, canonical)
+        return _b64(negated), {
+            "manifest": manifest,
+            "manifest_hash": "sha256:" + hashlib.sha256(canonical).hexdigest(),
+            "signature": "ed25519:" + _b64(signature),
+        }
+
+    store = StateStore(db_path=str(tmp_path / "state.db"))
+    await store.open()
+    try:
+        gate = FirmwareTelemetryGate(store)
+        await provision_and_approve(gate, "manifest_full_sealed")
+        rotated = signed_manifest_for_key(
+            rotated_seed, device_id=SEALED_DEVICE, **sealed
+        )
+        await gate.reprovision_device(
+            device_id=SEALED_DEVICE,
+            public_key_b64=rotated["public_key_b64"],
+            posture="sealed_flash",
+            manifest_message=rotated,
+            actor="op",
+            reason="key compromised",
+        )
+        assert await gate.approve_device(SEALED_DEVICE, actor="op", reason="rotation")
+
+        for seed, code in (
+            (GOLDEN_SEED, ERR_KEY_EPOCH_REUSED),
+            (rotated_seed, ERR_SAME_KEY_NOT_A_ROTATION),
+        ):
+            key_b64, message = negated_manifest(seed, rotated)
+            with pytest.raises(FirmwareVerificationError) as caught:
+                await gate.reprovision_device(
+                    device_id=SEALED_DEVICE,
+                    public_key_b64=key_b64,
+                    posture="sealed_flash",
+                    manifest_message=message,
+                    actor="op",
+                    reason="negated",
+                )
+            assert caught.value.code == code
+        assert await store.get_pending_firmware_anchor(SEALED_DEVICE) is None
+        row = await store.get_firmware_device(SEALED_DEVICE)
+        assert row is not None and row["public_key_b64"] == rotated["public_key_b64"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("case", _CORPUS["negated_keys"])
+def test_a_key_and_its_negation_share_one_identity(case: dict[str, str]) -> None:
+    """ed25519-key-admission/v1, vendored: both admitted, one identity, one holder."""
+    from ori.security.ed25519_keys import key_identity
+
+    public = bytes.fromhex(case["public_key_hex"])
+    negated = bytes.fromhex(case["negated_public_key_hex"])
+    identity = bytes.fromhex(case["identity_hex"])
+    assert refused_public_key_clause(public) is None
+    assert refused_public_key_clause(negated) is None
+    assert key_identity(public) == key_identity(negated) == identity
+    assert _library_accepts_signature(
+        negated,
+        bytes.fromhex(case["signature_hex"]),
+        bytes.fromhex(case["message_hex"]),
+    )
+
+
+def _binding_vectors() -> dict[str, Any]:
+    return json.loads(
+        (
+            REPO / "tests/vectors/commissioned_safety_binding/binding-vectors-v2.json"
+        ).read_text(encoding="utf-8")
+    )
+
+
+def _negate_hex(public_key_hex: str) -> str:
+    return _negated(bytes.fromhex(public_key_hex)).hex()
+
+
+def test_the_binding_verifier_refuses_a_negated_anchor_collision() -> None:
+    from ori.security.commissioning.binding import (
+        BindingRefusedError,
+        VerifierContext,
+        verify_binding,
+    )
+
+    case = _binding_vectors()["cases"][0]
+    context = dict(case["verifier_context"])
+    context["provisioning_anchor_hex"] = _negate_hex(
+        context["commissioning_anchor_current_hex"]
+    )
+    with pytest.raises(BindingRefusedError) as caught:
+        verify_binding(
+            case["binding"], VerifierContext.from_corpus(context), case["signature_b64"]
+        )
+    assert caught.value.reason == "anchor_collision"
+
+
+def test_the_profile_verifier_refuses_a_negated_anchor_collision() -> None:
+    from ori.security.commissioning.binding import (
+        BindingRefusedError,
+        ProfileContext,
+        verify_firmware_profile,
+    )
+
+    case = _binding_vectors()["firmware_profile_cases"][0]
+    context = dict(case["verifier_context"])
+    context["provisioning_anchor_hex"] = _negate_hex(
+        context["commissioning_anchor_current_hex"]
+    )
+    with pytest.raises(BindingRefusedError) as caught:
+        verify_firmware_profile(
+            case["firmware_profile"],
+            ProfileContext.from_corpus(context),
+            case["signature_b64"],
+        )
+    assert caught.value.reason == "anchor_collision"
+
+
+def test_an_authority_key_and_its_negation_cannot_hold_two_purposes(
+    tmp_path: Path,
+) -> None:
+    from ori.security.evidence.authority_keys import (
+        PURPOSE_EPOCH,
+        PURPOSE_RECEIPT,
+        REGISTRY_SCHEMA,
+        RULE_CROSS_PURPOSE,
+        AuthorityKeyError,
+        derive_key_id,
+        load_authority_key_registry,
+    )
+
+    _, honest = _honest()
+    document = {
+        "schema": REGISTRY_SCHEMA,
+        "keys": [
+            {
+                "key_id": derive_key_id(raw),
+                "public_key_hex": raw.hex(),
+                "purpose": purpose,
+                "status": "active",
+            }
+            for raw, purpose in (
+                (honest, PURPOSE_RECEIPT),
+                (_negated(honest), PURPOSE_EPOCH),
+            )
+        ],
+    }
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(AuthorityKeyError) as caught:
+        load_authority_key_registry(path)
+    assert caught.value.rule == RULE_CROSS_PURPOSE

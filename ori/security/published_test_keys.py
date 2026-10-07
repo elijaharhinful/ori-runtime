@@ -60,14 +60,20 @@ PUBLISHED_TEST_KEYS_B64: Final[tuple[str, ...]] = (
     "ncD5PLGaHZB2WOaVbZgsExrIPb2aqvMTpJLLoaM2Swo=",
     "oJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPA=",
     "skkdlQKuKGMKK6yy4MdFEP/N0yjDNP8+E5PnWy0x59w=",
+    "wGlTlhWM04I+ailc3+2iOiKSKWq8c6XlRBNVvxzYi5Q=",
     "xoImN8fTEOxXYnvgC6JZ0lN0n0qvZERwz/vlOjX3MkI=",
     "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc=",
     "ylfu0w5KcnTvTGSPVvWPiAsg0solcl2eXBPIPAjAmus=",
     "zRSzf5VulTGU/3+3Oz2B3MVh1hp1OAlLfD4aZD7l86o=",
 )
 
+# Each key under both signs of x: its seed's holder signs under the negation
+# too, with -a, so a check that knows the key by its bytes must know both.
 PUBLISHED_TEST_KEYS: Final[frozenset[bytes]] = frozenset(
-    base64.b64decode(key) for key in PUBLISHED_TEST_KEYS_B64
+    variant
+    for key in PUBLISHED_TEST_KEYS_B64
+    for raw in (base64.b64decode(key),)
+    for variant in (raw, raw[:31] + bytes([raw[31] ^ 0x80]))
 )
 
 
