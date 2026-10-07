@@ -189,11 +189,18 @@ def test_published_reading_unique_event_ids(sample_reading: SensorReading) -> No
 def test_published_reading_leaves_from_reading_canonical(
     sample_reading: SensorReading,
 ) -> None:
-    # from_reading keeps the canonical type; only the published form is retyped.
-    OriEvent.published_reading(sample_reading, device_id="dev-01")
-    event = OriEvent.from_reading(sample_reading, device_id="dev-01")
-    assert event.event_type == "sensor.reading"
-    assert event.fingerprint == ""
+    # from_reading keeps the canonical type; only the published form is retyped,
+    # and building one leaves neither the other nor the shared reading changed.
+    before = OriEvent.from_reading(sample_reading, device_id="dev-01")
+    published = OriEvent.published_reading(sample_reading, device_id="dev-01")
+    after = OriEvent.from_reading(sample_reading, device_id="dev-01")
+
+    assert published.event_type == "sensor.current"
+    assert published.fingerprint != ""
+    for canonical in (before, after):
+        assert canonical.event_type == "sensor.reading"
+        assert canonical.fingerprint == ""
+    assert sample_reading.metadata == {"source": "i2c"}
 
 
 def test_published_reading_is_what_http_telemetry_export_admits(
