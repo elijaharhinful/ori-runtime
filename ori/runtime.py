@@ -107,7 +107,6 @@ from ori.network.event_bus import EventBus
 from ori.network.events import (
     OriEvent,
     SensorReading,
-    compute_fingerprint,
     event_received_at_ms,
 )
 from ori.network.sms_webhook import SMSWebhookServer
@@ -4220,8 +4219,9 @@ class OriRuntime:
                     self._faulted_sensors.discard(sensor_cfg.id)
                     if self._status_indicator is not None and not self._faulted_sensors:
                         self._status_indicator.set_hardware_fault(False)
-                event = OriEvent.from_reading(reading, device_id)
-                event.event_type = f"sensor.{reading.sensor_type}"
+                # Adapters publish protocol provenance through
+                # reading.metadata["source"]; the poll path names no default.
+                event = OriEvent.published_reading(reading, device_id)
                 if not isinstance(event.context, dict):
                     event.context = {}
                 event.context["device_timezone"] = device_timezone
@@ -4233,10 +4233,6 @@ class OriRuntime:
                 calibration = getattr(sensor_cfg, "calibration", None)
                 if isinstance(calibration, dict) and calibration:
                     event.context["sensor_calibration"] = dict(calibration)
-                # Keep source explicit in the poll path; adapters must publish
-                # protocol provenance through reading.metadata["source"].
-                event.source = reading.metadata.get("source", "")
-                event.fingerprint = compute_fingerprint(reading, event.device_id)
                 # Queued, never awaited: a busy store must not delay or drop the
                 # reading's evaluation. Its row lands after, or is counted lost.
                 self._state_store.admit_history(event)

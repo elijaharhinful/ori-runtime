@@ -3713,6 +3713,41 @@ class TestSensorPolling:
         assert isinstance(event.fingerprint, str)
         assert event.fingerprint != ""
 
+    async def test_poll_sensor_publishes_the_reading_typed_by_sensor_type(self):
+        """The poll path publishes the published form, not the canonical one.
+
+        Building the event with ``OriEvent.from_reading`` and setting the rest
+        by hand, without the retype, would publish ``sensor.reading`` here.
+        """
+        runtime = OriRuntime(config_path="ori.yaml")
+        runtime._state_store = _store_mock()
+        runtime._shutdown_event = asyncio.Event()
+
+        reading = SensorReading(
+            sensor_id="cpu-sensor",
+            sensor_type="cpu_percent",
+            value=42.4,
+            unit="percent",
+            timestamp=1_700_000_000_000,
+            quality=1.0,
+            metadata={"source": "psutil"},
+        )
+
+        class _OneShotAdapter:
+            async def read(self, sensor_id: str) -> SensorReading:
+                runtime._shutdown_event.set()
+                return reading
+
+        bus = AsyncMock()
+        sensor_cfg: Any = SimpleNamespace(id="cpu-sensor", poll_interval_ms=1)
+        await runtime._poll_sensor(
+            cast(Any, _OneShotAdapter()), sensor_cfg, bus, "dev-01"
+        )
+
+        event = bus.publish.call_args.args[0]
+        assert event.event_type == "sensor.cpu_percent"
+        assert event.source == "psutil"
+
     async def test_poll_sensor_sets_site_context_from_device_site_type(self):
         runtime = OriRuntime(config_path="ori.yaml")
         runtime._state_store = _store_mock()
