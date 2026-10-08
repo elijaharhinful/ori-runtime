@@ -14,6 +14,11 @@ release is cut.
   across the upgrade is closed with its safe default, as at every restart,
   and is not approved under the new digest; the next trigger raises a new
   proposal.
+- An MQTT-family sensor whose `topic`, or a Victron sensor whose
+  `portal_id`, contains the wildcard `+` or `#` is now refused at config
+  load, so a runtime carrying one no longer starts. Before, it started and
+  that sensor silently never read. Before restarting on this release,
+  replace each wildcard with one sensor per concrete topic.
 
 ## Added
 
