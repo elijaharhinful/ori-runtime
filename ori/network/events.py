@@ -60,6 +60,22 @@ class OriEvent:
             received_at_ms=now_ms(),
         )
 
+    @classmethod
+    def published_reading(
+        cls, reading: SensorReading, device_id: str, *, default_source: str = ""
+    ) -> "OriEvent":
+        """The event a producer publishes for *reading*: typed, sourced, fingerprinted.
+
+        Every producer builds its event here, so the shape consumers such as
+        HTTP telemetry export expect is stated once. *default_source* names
+        the producer when the reading carries no ``metadata["source"]``.
+        """
+        event = cls.from_reading(reading, device_id)
+        event.event_type = f"sensor.{reading.sensor_type}"
+        event.source = reading.metadata.get("source", default_source)
+        event.fingerprint = compute_fingerprint(reading, device_id)
+        return event
+
 
 def history_as_of(event: Optional[OriEvent]) -> dict[str, int]:
     """The keyword that bounds an evaluation-time history read to *event*'s frontier."""

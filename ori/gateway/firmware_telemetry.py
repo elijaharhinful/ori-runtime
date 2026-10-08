@@ -22,7 +22,7 @@ from ori.gateway.mqtt_security import apply_tls_context, parse_gateway_broker_ur
 from ori.hal.base import MeasurementRefusedError, refuse_unusable_reading
 from ori.network.deduplicator import EventDeduplicator
 from ori.network.event_bus import EventBus
-from ori.network.events import OriEvent, compute_fingerprint
+from ori.network.events import OriEvent
 from ori.security.firmware.ingest import FirmwareTelemetryGate
 from ori.security.firmware.liveness import FirmwareLivenessSupervisor
 from ori.state.store import StateStore
@@ -212,10 +212,9 @@ class MqttFirmwareTelemetrySubscriber:
                     exc,
                 )
                 continue
-            event = OriEvent.from_reading(reading, self._runtime_device_id)
-            event.event_type = f"sensor.{reading.sensor_type}"
-            event.source = reading.metadata.get("source", "firmware")
-            event.fingerprint = compute_fingerprint(reading, event.device_id)
+            event = OriEvent.published_reading(
+                reading, self._runtime_device_id, default_source="firmware"
+            )
             # Freshness was verified in the gate, ahead of this; the history
             # row is queued so a busy store cannot delay or drop the reading.
             self._state_store.admit_history(event)

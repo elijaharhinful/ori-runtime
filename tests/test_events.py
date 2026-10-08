@@ -11,6 +11,7 @@ from ori.network.events import (
     SensorReading,
     compute_fingerprint,
 )
+from ori.telemetry.http_export import _is_published_reading
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -116,6 +117,97 @@ def test_ori_event_from_reading_unique_event_ids(sample_reading: SensorReading) 
 def test_ori_event_from_reading_attaches_reading(sample_reading: SensorReading) -> None:
     event = OriEvent.from_reading(sample_reading, device_id="dev-01")
     assert event.reading is sample_reading
+
+
+# ---------------------------------------------------------------------------
+# OriEvent.published_reading
+# ---------------------------------------------------------------------------
+
+
+def _reading_without_source() -> SensorReading:
+    return SensorReading(
+        sensor_id="temp-01",
+        sensor_type="temperature",
+        value=25.0,
+        unit="celsius",
+        timestamp=1_700_000_000_000,
+        quality=1.0,
+    )
+
+
+def test_published_reading_is_typed_by_sensor_type(
+    sample_reading: SensorReading,
+) -> None:
+    event = OriEvent.published_reading(sample_reading, device_id="dev-01")
+    assert event.event_type == "sensor.current"
+
+
+def test_published_reading_carries_the_reading_and_its_identity(
+    sample_reading: SensorReading,
+) -> None:
+    event = OriEvent.published_reading(sample_reading, device_id="dev-01")
+    assert event.reading is sample_reading
+    assert event.device_id == "dev-01"
+    assert event.sensor_id == sample_reading.sensor_id
+    assert event.timestamp == sample_reading.timestamp
+    assert event.received_at_ms > 0
+
+
+def test_published_reading_is_fingerprinted(sample_reading: SensorReading) -> None:
+    event = OriEvent.published_reading(sample_reading, device_id="dev-01")
+    assert event.fingerprint == compute_fingerprint(sample_reading, "dev-01")
+
+
+def test_published_reading_source_from_metadata(
+    sample_reading: SensorReading,
+) -> None:
+    # The reading's own provenance wins over the producer's default.
+    event = OriEvent.published_reading(
+        sample_reading, device_id="dev-01", default_source="firmware"
+    )
+    assert event.source == "i2c"
+
+
+def test_published_reading_source_falls_back_to_the_producer_default() -> None:
+    event = OriEvent.published_reading(
+        _reading_without_source(), device_id="dev-01", default_source="firmware"
+    )
+    assert event.source == "firmware"
+
+
+def test_published_reading_source_empty_when_nothing_names_one() -> None:
+    event = OriEvent.published_reading(_reading_without_source(), device_id="dev-01")
+    assert event.source == ""
+
+
+def test_published_reading_unique_event_ids(sample_reading: SensorReading) -> None:
+    event_a = OriEvent.published_reading(sample_reading, device_id="dev-01")
+    event_b = OriEvent.published_reading(sample_reading, device_id="dev-01")
+    assert event_a.event_id != event_b.event_id
+
+
+def test_published_reading_leaves_from_reading_canonical(
+    sample_reading: SensorReading,
+) -> None:
+    # from_reading keeps the canonical type; only the published form is retyped,
+    # and building one leaves neither the other nor the shared reading changed.
+    before = OriEvent.from_reading(sample_reading, device_id="dev-01")
+    published = OriEvent.published_reading(sample_reading, device_id="dev-01")
+    after = OriEvent.from_reading(sample_reading, device_id="dev-01")
+
+    assert published.event_type == "sensor.current"
+    assert published.fingerprint != ""
+    for canonical in (before, after):
+        assert canonical.event_type == "sensor.reading"
+        assert canonical.fingerprint == ""
+    assert sample_reading.metadata == {"source": "i2c"}
+
+
+def test_published_reading_is_what_http_telemetry_export_admits(
+    sample_reading: SensorReading,
+) -> None:
+    event = OriEvent.published_reading(sample_reading, device_id="dev-01")
+    assert _is_published_reading(event)
 
 
 # ---------------------------------------------------------------------------
