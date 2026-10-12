@@ -19,7 +19,7 @@ from unittest.mock import patch
 import pytest
 
 from ori.hal.base import AdapterConnectionError, AdapterReadError
-from ori.hal.mqtt_base import subscription_refusal
+from ori.hal.mqtt_base import MqttCachedAdapter, subscription_refusal
 from ori.hal.protocol_registry import MQTT_FAMILY_PROTOCOLS, make_adapter
 from tests.test_mqtt_adapter import _FakeClient
 from tests.test_mqtt_family_hostile_payloads import _LostConnection
@@ -68,6 +68,12 @@ def _config(protocol: str) -> dict[str, Any]:
         "broker_host": "192.168.1.50",
         key: "w/a",
     }
+
+
+def _adapter(protocol: str) -> MqttCachedAdapter:
+    adapter = make_adapter(protocol)
+    assert isinstance(adapter, MqttCachedAdapter)
+    return adapter
 
 
 async def _spin(times: int = 20) -> None:
@@ -123,14 +129,14 @@ async def test_a_refused_subscription_fails_the_connect(protocol: str) -> None:
     broker = _Broker()
     available, module = _patched(broker)
     with available, module:
-        learner = make_adapter(protocol)
+        learner = _adapter(protocol)
         await learner.connect(_config(protocol))
         topics = list(broker.clients[-1].subscriptions)
         await learner.close()
         denied = topics[-1]
         broker.answer = lambda topic: NOT_AUTHORISED if topic == denied else GRANTED
 
-        adapter = make_adapter(protocol)
+        adapter = _adapter(protocol)
         with pytest.raises(AdapterConnectionError) as caught:
             await adapter.connect(_config(protocol))
 
@@ -153,11 +159,12 @@ async def test_a_subscription_refused_on_reconnect_keeps_the_link_down(
     broker = _Broker()
     available, module = _patched(broker)
     with available, module, patch("ori.hal.mqtt_base.reconnect_delay", lambda _a: 0):
-        adapter = make_adapter(protocol)
+        adapter = _adapter(protocol)
         await adapter.connect(_config(protocol))
         try:
             first = broker.clients[0]
             listener = adapter._listener_task
+            assert listener is not None
             broker.answer = NOT_AUTHORISED
             with caplog.at_level(logging.WARNING, logger="ori.hal.mqtt_base"):
                 await first._queue.put(_LostConnection())
