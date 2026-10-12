@@ -72,8 +72,9 @@ class _FakeClient:
     async def __aexit__(self, _exc_type, _exc, _tb):
         self.closed = True
 
-    async def subscribe(self, topic: str) -> None:
+    async def subscribe(self, topic: str) -> tuple[int, ...]:
         self.subscriptions.append(topic)
+        return (0,)
 
     @property
     def messages(self):

@@ -199,6 +199,15 @@ release is cut.
   because a value is cached under the topic of the message that carried it
   and read under the configured one. The adapters refuse it too, before
   dialling the broker. One sensor reads one concrete topic.
+- An MQTT-family sensor adapter no longer takes a subscription the broker
+  refused as a subscription. A broker whose ACL denies the topic answers
+  with a refusal and keeps the connection up; the adapter read the link as
+  up and reads said no data was cached yet, indefinitely. A refusal now
+  fails the connect, naming the topic and the broker's code. At start the
+  sensor is skipped and reported unconnected, and is not retried until the
+  runtime restarts; on a reconnect the refusal is logged at each attempt,
+  reads stay refused, and the adapter keeps retrying under the same
+  back-off.
 - `aiomqtt` is in the runtime lock, so the MQTT perception adapters install
   from the release bundle. Connecting one on a Raspberry Pi is not yet
   observed.

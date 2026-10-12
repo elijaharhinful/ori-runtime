@@ -36,10 +36,34 @@ RECONNECT_STABLE_S = 30.0
 # carries one in its topic.
 MQTT_TOPIC_WILDCARDS = ("+", "#")
 
+# The SUBACK codes that grant a subscription; every other code refuses it.
+MQTT_GRANTED_QOS = (0, 1, 2)
+
 
 def topic_wildcards(topic: str) -> tuple[str, ...]:
     """The wildcard characters *topic* carries; empty for a concrete topic."""
     return tuple(char for char in MQTT_TOPIC_WILDCARDS if char in topic)
+
+
+def subscription_refusal(granted: Any) -> str | None:
+    """Why the broker's answer to one SUBSCRIBE is not a subscription, or None.
+
+    aiomqtt returns the SUBACK codes and raises on none of them: 0 to 2 is the
+    QoS the broker granted, and 0x80 and above is a refusal, which is how an
+    ACL denying the topic answers. An answer that carries no code, or one that
+    cannot be read, grants nothing.
+    """
+    codes = list(granted) if isinstance(granted, (list, tuple)) else [granted]
+    if not codes:
+        return "the SUBACK carried no code"
+    for code in codes:
+        value = getattr(code, "value", code)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return f"unreadable SUBACK code {code!r}"
+        if value not in MQTT_GRANTED_QOS:
+            name = "" if code is value else f" {code}"
+            return f"SUBACK {value:#04x}{name}"
+    return None
 
 
 def reconnect_delay(attempt: int, rng: random.Random | None = None) -> float:
@@ -531,7 +555,14 @@ class MqttCachedAdapter(BaseAdapter):
             raise
         try:
             for topic in self._topics:
-                await self._client.subscribe(topic)
+                # Sending SUBSCRIBE is not being subscribed: a broker whose ACL
+                # denies the topic answers with a refusal and keeps the link up.
+                refusal = subscription_refusal(await self._client.subscribe(topic))
+                if refusal is not None:
+                    raise AdapterConnectionError(
+                        f"the broker refused the subscription to topic={topic!r} "
+                        f"({refusal}); check the broker's ACL for this client"
+                    )
         except BaseException:
             await self._close_mqtt_quietly()
             raise
