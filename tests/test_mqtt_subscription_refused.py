@@ -3,9 +3,12 @@
 
 """A subscription the broker refuses is not a subscription.
 
-A broker whose ACL denies a topic answers SUBSCRIBE with a refusal and keeps
-the connection up. Taken as success, the link read as up, the breaker stayed
-closed and reads said no data was cached yet, for as long as the runtime ran.
+A broker can answer SUBSCRIBE with a refusal and keep the connection up. Taken
+as success, the link read as up, the breaker stayed closed and reads said no
+data was cached yet, for as long as the runtime ran.
+
+A broker that grants the subscription and withholds delivery, as mosquitto's
+`acl_file` does, is outside what these tests or the check can see.
 """
 
 from __future__ import annotations
