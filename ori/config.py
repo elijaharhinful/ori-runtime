@@ -17,6 +17,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
+from ori.config_fields import ConfigValidationError
+from ori.config_fields import require_optional_str as _require_optional_str
+from ori.config_fields import require_str as _require_str
 from ori.hal.config_schema import (
     DocumentError,
     SchemaError,
@@ -81,10 +84,6 @@ _WHATSAPP_TEMPLATE_INTENTS = (
 # If Ori is ported to a non-Broadcom SoC, replace this with a hardware-profile
 # abstraction rather than removing startup pin validation.
 _VALID_BCM_PINS: frozenset[int] = frozenset(range(2, 28))
-
-
-class ConfigValidationError(Exception):
-    pass
 
 
 class _ConfigDocumentLimitError(Exception):
@@ -1454,10 +1453,15 @@ def _parse_skills(data: Any) -> list[SkillConfig]:
                 "actions."
             )
 
+        version = _require_optional_str(
+            item.get("version"),
+            f"skills[{i}].version",
+            skill_name=name,
+        )
         skills.append(
             SkillConfig(
                 name=name,
-                version=str(item.get("version", "")),
+                version=version,
                 config={},
             )
         )
@@ -3543,10 +3547,3 @@ def _parse_logging(data: Any) -> LoggingConfig:
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-
-
-def _require_str(data: dict, key: str, context: str) -> str:
-    value = data.get(key)
-    if value is None:
-        raise ConfigValidationError(f"'{context}.{key}' is required but missing.")
-    return str(value)

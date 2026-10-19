@@ -17,7 +17,7 @@ MAX_MODULE_LINES = 2500
 OVERSIZE_CEILINGS: dict[str, int] = {
     "ori/runtime.py": 8001,
     "ori/reasoning/action_dispatcher.py": 5011,
-    "ori/config.py": 3552,
+    "ori/config.py": 3549,
     "ori/installer/linux.py": 3377,
     "ori/security/evidence/ledger.py": 2960,
 }

@@ -645,3 +645,67 @@ def test_single_skill_unreadable_file_json(tmp_path: Path, monkeypatch, capsys) 
     assert doc["status"] == "error"
     assert "could not read" in doc["error"]
     _assert_no_traceback(captured)
+
+
+_METADATA = {"name": "trip-relay", "version": "0.1.0", "author": "test"}
+
+
+def _write_skill_with_metadata(skill_dir: Path, field: str, value: str) -> None:
+    metadata = dict(_METADATA, **{field: value})
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "skill.yaml").write_text(
+        f"name: {metadata['name']}\n"
+        f"version: {metadata['version']}\n"
+        f"author: {metadata['author']}\n"
+        + textwrap.dedent(
+            """\
+            signature: bundled
+            sensors_required:
+              - type: current_clamp
+                protocol: i2c
+            triggers:
+              - name: over_threshold
+                condition: "value > 5.0"
+                action_tier: A
+            actions:
+              available:
+                - name: alert_whatsapp
+                  tier: A
+              defaults:
+                over_threshold: [alert_whatsapp]
+            """
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("field", ["name", "version", "author"])
+@pytest.mark.parametrize(
+    "value", ["{actions: [trip_relay]}", "[a, b]", "1.0", "2", "true", "2026-10-19"]
+)
+@pytest.mark.parametrize("as_json", [False, True])
+def test_non_string_metadata_exits_failed(
+    tmp_path: Path, field: str, value: str, as_json: bool, monkeypatch, capsys
+) -> None:
+    """skill.yaml name, version and author are strings, never str() of another type."""
+    monkeypatch.setattr(
+        "ori.skills.loader.SkillLoader._is_core_bundled_skill",
+        lambda self, skill_dir: True,
+    )
+    skill_dir = tmp_path / "bad-metadata"
+    _write_skill_with_metadata(skill_dir, field, value)
+
+    rc = main(["skills", "validate", str(skill_dir)] + (["--json"] if as_json else []))
+
+    captured = capsys.readouterr()
+    assert rc == EXIT_FAILED
+    _assert_no_traceback(captured)
+    if as_json:
+        doc = _read_json(captured)
+        assert doc["status"] == "invalid"
+        message = json.dumps(doc)
+    else:
+        message = captured.out + captured.err
+    assert f"{field} must be a string" in message
+    assert ("quote the value" in message) is (not value.startswith(("{", "[")))
+    assert ("trip-relay" if field != "name" else "bad-metadata") in message

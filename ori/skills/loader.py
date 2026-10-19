@@ -24,6 +24,7 @@ import ast
 import asyncio
 import base64
 import binascii
+import datetime
 import errno
 import importlib.util
 import inspect
@@ -1008,7 +1009,7 @@ class SkillLoader:
 
         return Skill(
             name=raw.get("name", ""),
-            version=str(raw.get("version", "0.0.0")),
+            version=raw["version"],
             author=raw.get("author", ""),
             sensors_required=raw.get("sensors_required") or [],
             triggers=triggers,
@@ -1428,6 +1429,25 @@ class SkillLoader:
     def _validate_skill_metadata(self, raw: dict[str, Any], skill_dir: Path) -> None:
         """Validate core metadata presence for runtime-loadable skills."""
         skill_dir_name = skill_dir.name
+        declared_name = raw.get("name")
+        who = (
+            f"Skill {declared_name!r}"
+            if isinstance(declared_name, str) and declared_name.strip()
+            else f"Skill directory {skill_dir_name!r}"
+        )
+        for key in ("name", "version", "author"):
+            value = raw.get(key)
+            if value is not None and not isinstance(value, str):
+                hint = (
+                    "; YAML reads an unquoted number, boolean or date as that "
+                    "type, so quote the value"
+                    if isinstance(value, (bool, int, float, datetime.date))
+                    else ""
+                )
+                raise SkillValidationError(
+                    f"{who}: {key} must be a string, "
+                    f"got {type(value).__name__}: {value!r}{hint}"
+                )
         name = str(raw.get("name") or "").strip()
         version = str(raw.get("version") or "").strip()
         author = str(raw.get("author") or "").strip()

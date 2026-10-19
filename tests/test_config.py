@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import textwrap
@@ -6631,3 +6632,102 @@ def test_hardened_posture_needs_an_operator_for_either_approval_channel(channel)
             database_path="ori_state.db",
             config_signature_verified=True,
         )
+
+
+def test_skill_version_rejects_non_string(tmp_path):
+    """skills[].version must be a string or absent — not str() of a mapping."""
+    path = _write_yaml(
+        tmp_path,
+        """
+        device:
+          id: dev-1
+          name: Lab Node
+          location: lab
+        sensors: []
+        skills:
+          - name: trip-relay
+            version: {actions: [trip_relay]}
+        """,
+    )
+    with pytest.raises(ConfigValidationError) as exc:
+        Config.load(path)
+    msg = str(exc.value)
+    assert "version" in msg
+    assert "trip-relay" in msg
+
+
+def test_skill_version_accepts_string_and_absent(tmp_path):
+    path = _write_yaml(
+        tmp_path,
+        """
+        device:
+          id: dev-1
+          name: Lab Node
+          location: lab
+        sensors: []
+        skills:
+          - name: trip-relay
+            version: "1.2.3"
+          - name: other
+        """,
+    )
+    cfg = Config.load(path)
+    by_name = {s.name: s for s in cfg.skills}
+    assert by_name["trip-relay"].version == "1.2.3"
+    assert by_name["other"].version == ""
+
+
+_STRING_FIELDS_YAML = """
+device:
+  id: {device_id}
+  name: {device_name}
+  location: {location}
+sensors: []
+skills:
+  - name: {skill_name}
+    version: {version}
+"""
+_STRING_FIELD_DEFAULTS = {
+    "device_id": "dev-1",
+    "device_name": "Lab Node",
+    "location": "lab",
+    "skill_name": "trip-relay",
+    "version": "'1.2.3'",
+}
+
+
+@pytest.mark.parametrize(
+    ("field", "context"),
+    [
+        ("device_id", "device.id"),
+        ("device_name", "device.name"),
+        ("location", "device.location"),
+        ("skill_name", "skills[0].name"),
+        ("version", "skills[0].version"),
+    ],
+)
+@pytest.mark.parametrize(
+    "value", ["{actions: [trip_relay]}", "[a, b]", "1.0", "2", "true", "2026-10-19"]
+)
+def test_string_fields_refuse_other_types(tmp_path, field, context, value):
+    """A string field is refused, not str()-coerced, whatever other type YAML gives."""
+    path = _write_yaml(
+        tmp_path,
+        _STRING_FIELDS_YAML.format(**dict(_STRING_FIELD_DEFAULTS, **{field: value})),
+    )
+    with pytest.raises(ConfigValidationError, match=re.escape(context)) as exc:
+        Config.load(path)
+    msg = str(exc.value)
+    assert "must be a string" in msg
+    scalar = not value.startswith(("{", "["))
+    assert ("quote the value" in msg) is scalar
+    if field == "version":
+        assert "trip-relay" in msg
+
+
+def test_a_null_skill_version_loads_as_absent(tmp_path):
+    path = _write_yaml(
+        tmp_path,
+        _STRING_FIELDS_YAML.format(**dict(_STRING_FIELD_DEFAULTS, version="null")),
+    )
+    assert Config.load(path).skills[0].version == ""
