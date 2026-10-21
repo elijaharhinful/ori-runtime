@@ -84,6 +84,7 @@ from tests.conftest import (
     run_runtime_full_startup,
     run_runtime_until,
 )
+from tests.gateway_auth_helpers import cache_for
 from tests.waiting import DEADLINE_S, settle, wait_until
 
 
@@ -543,7 +544,10 @@ def test_build_gateway_message_auth_accepts_previous_env_secret(monkeypatch):
         )
     )
     previous_auth = GatewayMessageAuthenticator(
-        GatewayMessageAuthConfig(shared_secret="previous-secret")
+        GatewayMessageAuthConfig(shared_secret="previous-secret"),
+        replay_cache=cache_for(
+            GatewayMessageAuthConfig(shared_secret="previous-secret")
+        ),
     )
     payload = {
         "request_id": "req-1",
@@ -556,6 +560,8 @@ def test_build_gateway_message_auth_accepts_previous_env_secret(monkeypatch):
         signed_at_ms=1_000,
     )
 
+    # The receiver starts at the test's clock, so its start floor admits it.
+    monkeypatch.setattr("ori.security.gateway_messages.now_ms", lambda: 1_000)
     auth = _build_gateway_message_auth(config)
 
     assert auth is not None
