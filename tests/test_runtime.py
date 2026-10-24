@@ -2750,6 +2750,32 @@ class TestLifecycle:
         trigger.assert_awaited_once_with(duration_seconds=None)
 
 
+@pytest.mark.asyncio
+async def test_stop_closes_the_adapters_through_the_concurrent_close(
+    minimal_config: Path, monkeypatch
+):
+    """Closed one after another, adapters mid-connect add their waits."""
+    _patch_external(monkeypatch)
+    _treat_scratch_skills_as_packaged(monkeypatch)
+    handed: list[list[Any]] = []
+    from ori.sensor_connection import close_adapters as real
+
+    async def spy(adapters):
+        handed.append(list(adapters))
+        await real(adapters)
+
+    monkeypatch.setattr("ori.runtime.close_adapters", spy)
+    runtime = OriRuntime(config_path=str(minimal_config))
+    start_task = asyncio.create_task(runtime.start())
+    await wait_until(
+        lambda: bool(runtime._adapters) or start_task.done(),
+        what="an adapter to connect, or startup to end",
+    )
+    adapters = list(runtime._adapters)
+    await _stop_and_join(runtime, start_task)
+    assert adapters and handed == [adapters]
+
+
 class TestStartupLogs:
     async def test_startup_logs_skill_tiers(self, minimal_config, monkeypatch, caplog):
         """After start(), caplog must contain '[skill]' with trigger + tier."""
