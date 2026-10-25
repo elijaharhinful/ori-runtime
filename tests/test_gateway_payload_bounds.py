@@ -853,7 +853,9 @@ def test_the_replay_cache_holds_every_message_the_families_admit_in_a_window():
 
 def test_the_runtime_sizes_each_gateway_replay_cache_for_the_window(monkeypatch):
     from ori.config import GatewayConfig
-    from ori.runtime import _build_gateway_message_auth
+    from ori.gateway.envelope_auth import (
+        build_gateway_message_auth as _build_gateway_message_auth,
+    )
 
     monkeypatch.setenv("GATEWAY_SHARED_SECRET", SECRET)
     for persistent in (True, False):
@@ -947,7 +949,9 @@ async def test_any_replay_window_the_contract_admits_starts_and_records(
     """Through the runtime's own builder, persistent: the window is decided in
     one place, so no expiry, cache size or SQL bound leaves its range."""
     from ori.config import GatewayConfig
-    from ori.runtime import _build_gateway_message_auth
+    from ori.gateway.envelope_auth import (
+        build_gateway_message_auth as _build_gateway_message_auth,
+    )
     from ori.security.gateway_messages import replay_retention_ms, replay_window_ms
 
     monkeypatch.setenv("GATEWAY_SHARED_SECRET", SECRET)
@@ -1872,7 +1876,9 @@ def test_a_key_a_previous_release_stored_lives_until_its_envelope_is_stale(
     import sqlite3
 
     from ori.config import GatewayConfig
-    from ori.runtime import _build_gateway_message_auth
+    from ori.gateway.envelope_auth import (
+        build_gateway_message_auth as _build_gateway_message_auth,
+    )
 
     clock = [1_000_000_000]
     monkeypatch.setattr("ori.security.gateway_messages.now_ms", lambda: clock[0])
@@ -1943,7 +1949,9 @@ def test_a_key_a_previous_release_stored_lives_until_its_envelope_is_stale(
 
 def _restarting_auth(db: Any, *, skew: int, monkeypatch: Any) -> Any:
     from ori.config import GatewayConfig
-    from ori.runtime import _build_gateway_message_auth
+    from ori.gateway.envelope_auth import (
+        build_gateway_message_auth as _build_gateway_message_auth,
+    )
 
     monkeypatch.setenv("GATEWAY_SHARED_SECRET", SECRET)
     config: Any = SimpleNamespace(
@@ -2155,51 +2163,65 @@ def test_a_replay_cache_never_grows_past_its_ceiling():
 
 
 def test_every_gateway_route_built_by_the_runtime_shares_one_envelope_state():
-    """Read from `Runtime.start` itself: every route builder is handed the
-    one replay cache and signing clock, so the table is held once per process,
-    not once per route, and one clock signs for every signer."""
+    """Read from the startup stages themselves: every route builder is handed
+    the one replay cache and signing clock, so the table is held once per
+    process, not once per route, and one clock signs for every signer."""
     import ast
-    import importlib
-    import inspect
+
+    from tests.package_layout import runtime_methods, runtime_tree
 
     builders = {
-        "_build_gateway_reasoner",
+        "build_gateway_reasoner",
         "_start_gateway_export_responder_if_enabled",
-        "_build_gateway_heartbeat_subscriber",
-        "_build_evidence_inbound_subscriber",
-        "_build_evidence_outbound_publisher",
-        "_build_runtime_node_heartbeat_publisher",
+        "build_gateway_heartbeat_subscriber",
+        "build_evidence_inbound_subscriber",
+        "build_evidence_outbound_publisher",
+        "build_runtime_node_heartbeat_publisher",
     }
-    tree = ast.parse(inspect.getsource(importlib.import_module("ori.runtime")))
-    (start,) = [
+    stages = [
         node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "start"
+        for name, node in runtime_methods().items()
+        if isinstance(node, ast.AsyncFunctionDef) and name.startswith("_stage_")
     ]
-    called: dict[str, bool] = {}
-    for node in ast.walk(start):
-        if isinstance(node, ast.Call):
-            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
-            if name in builders:
-                called[name] = any(
-                    isinstance(arg, ast.Name) and arg.id == "gateway_envelope_state"
-                    for arg in [*node.args, *(k.value for k in node.keywords)]
-                )
-    assert called == dict.fromkeys(builders, True)
-    # Built once: no second cache assigned to the name between the calls.
-    built = [
-        node
-        for node in ast.walk(start)
-        if isinstance(node, ast.Assign)
-        and any(
-            getattr(t, "id", None) == "gateway_envelope_state" for t in node.targets
+    assert stages, "OriRuntime has no startup stages to read"
+
+    def the_envelope_state(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "context"
+            and node.attr == "gateway_envelope_state"
         )
-        and isinstance(node.value, ast.Call)
-    ]
+
+    called: dict[str, bool] = {}
+    built = []
+    for stage in stages:
+        for node in ast.walk(stage):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "id", None) or getattr(
+                    node.func, "attr", None
+                )
+                if name in builders:
+                    called[name] = called.get(name, True) and any(
+                        the_envelope_state(arg)
+                        for arg in [*node.args, *(k.value for k in node.keywords)]
+                    )
+            # Built once: no second cache assigned anywhere in startup.
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Call)
+                and any(
+                    the_envelope_state(t)
+                    or getattr(t, "id", None) == "gateway_envelope_state"
+                    for t in node.targets
+                )
+            ):
+                built.append(node)
+    assert called == dict.fromkeys(builders, True)
     assert len(built) == 1
     # And every route builder hands its cache on: no authenticator in the
-    # module is built without the cache its builder was given.
-    for function in ast.walk(tree):
+    # runtime is built without the cache its builder was given.
+    for function in ast.walk(runtime_tree()):
         if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         for node in ast.walk(function):
@@ -2216,7 +2238,12 @@ def test_every_gateway_route_built_by_the_runtime_shares_one_envelope_state():
 
 def test_a_route_builder_uses_the_envelope_state_it_is_given(monkeypatch):
     from ori.config import GatewayConfig
-    from ori.runtime import _build_gateway_envelope_state, _build_gateway_message_auth
+    from ori.gateway.envelope_auth import (
+        build_gateway_envelope_state as _build_gateway_envelope_state,
+    )
+    from ori.gateway.envelope_auth import (
+        build_gateway_message_auth as _build_gateway_message_auth,
+    )
 
     monkeypatch.setenv("GATEWAY_SHARED_SECRET", SECRET)
     config: Any = SimpleNamespace(

@@ -3,10 +3,10 @@
 
 """A sensor entry must not displace what the runtime supplies to an adapter.
 
-`runtime.py` injects the sensor's identity and the HAL circuit-breaker settings
-into the dict handed to `adapter.connect()`. Those names were not in the
-first-class set `_parse_sensors` withholds, and metadata was spread last, so a
-sensor entry could overwrite them.
+`ori/runtime/_device_io.py` injects the sensor's identity and the HAL
+circuit-breaker settings into the dict handed to `adapter.connect()`. Those
+names were not in the first-class set `_parse_sensors` withholds, and metadata
+was spread last, so a sensor entry could overwrite them.
 
 Two consequences made this a safety defect rather than an untidiness. A sensor
 could raise `failure_threshold` to a value its adapter would never reach,
@@ -36,6 +36,7 @@ from ori.config._sensors import parse_sensors as _parse_sensors
 from ori.hal.base import CircuitState
 from ori.hal.psutil_adapter import PsutilAdapter
 from ori.runtime import adapter_connect_config
+from tests.package_layout import runtime_tree
 
 
 def _sensor(**overrides: Any) -> list[dict]:
@@ -308,9 +309,8 @@ def test_start_uses_the_shared_assembly_rather_than_its_own_dict() -> None:
     the call site, so the unit and its caller cannot drift apart.
     """
     import ast
-    import pathlib
 
-    tree = ast.parse(pathlib.Path("ori/runtime.py").read_text())
+    tree = runtime_tree()
     calls, literals = 0, 0
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):

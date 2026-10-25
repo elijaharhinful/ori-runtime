@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Callable, Iterator
+import shutil
+import tempfile
+from collections.abc import Callable, Generator, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -70,49 +73,166 @@ def _real_gpio_allowed() -> bool:
     return os.environ.get(ALLOW_GPIO_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
-_CONFIG_BINDINGS = pytest.StashKey[dict[str, int]]()
-_SESSION_CONFIG_BINDINGS = pytest.StashKey[dict[str, int]]()
-
-
 def pytest_configure(config: pytest.Config) -> None:
-    from tests.config_layout import bindings, hold_reexports
+    from tests.package_layout import hold_reexports
 
     hold_reexports()
-    config.stash[_SESSION_CONFIG_BINDINGS] = bindings()
+
+
+_LATE_PATCHES_DIR = pytest.StashKey[Path]()
+_LATE_PATCHES_KEY = "ori_late_patch_findings"
+#: Every worker the controller configured, each of which must leave a file.
+_LATE_PATCHES_WORKERS = pytest.StashKey[set[str]]()
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node: Any) -> None:
+    """Give each xdist worker a place to leave what it found after its last
+    test: by then it has already sent the controller its exit status."""
+    config = node.config
+    if _LATE_PATCHES_DIR not in config.stash:
+        left = Path(tempfile.mkdtemp(prefix="ori-late-"))
+        config.stash[_LATE_PATCHES_DIR] = left
+        config.stash[_LATE_PATCHES_WORKERS] = set()
+        config.add_cleanup(lambda: shutil.rmtree(left, ignore_errors=True))
+    config.stash[_LATE_PATCHES_WORKERS].add(node.workerinput["workerid"])
+    node.workerinput[_LATE_PATCHES_KEY] = str(config.stash[_LATE_PATCHES_DIR])
+
+
+class _LateCheck:
+    """The check after the last test, as a plugin registered when the session
+    starts: after every plugin pytest registers while it configures, so its
+    wrapper is outside theirs."""
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_sessionfinish(self, session: pytest.Session) -> Iterator[None]:
+        """Fail the run for what changed after the last test's teardown check,
+        where no test's report is left to carry it.
+
+        A worker leaves its findings for the controller, which reads them here,
+        after every worker has stopped.
+        """
+        from tests.package_layout import begin_phase
+
+        result = yield
+        config = session.config
+        problems = begin_phase("After the last test")
+        workerinput = getattr(config, "workerinput", None)
+        if workerinput is not None and _LATE_PATCHES_KEY in workerinput:
+            # Written even when clean: a missing file is a worker that stopped
+            # before its check finished, never one that found nothing.
+            found = Path(workerinput[_LATE_PATCHES_KEY]) / workerinput["workerid"]
+            # Renamed into place whole, so a worker stopped while writing
+            # leaves no file rather than an empty one that reads as clean.
+            partial = found.with_name(f"{found.name}.partial")
+            partial.write_text("\n".join(problems), encoding="utf-8")
+            os.replace(partial, found)
+            return result
+        if _LATE_PATCHES_DIR in config.stash:
+            left = config.stash[_LATE_PATCHES_DIR]
+            for worker in sorted(config.stash[_LATE_PATCHES_WORKERS]):
+                found = left / worker
+                if not found.exists():
+                    problems.append(
+                        f"After the last test: worker {worker} stopped before its "
+                        "check of the bindings finished, so what it left is unknown."
+                    )
+                    continue
+                problems += found.read_text(encoding="utf-8").splitlines()
+        if problems:
+            writer = config.get_terminal_writer()
+            writer.line()
+            writer.sep("=", "patch targets", red=True)
+            for problem in problems:
+                writer.line(problem, red=True)
+            # An interrupted or broken run keeps the status that says so.
+            if session.exitstatus in (
+                pytest.ExitCode.OK,
+                pytest.ExitCode.NO_TESTS_COLLECTED,
+            ):
+                session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        return result
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    session.config.pluginmanager.register(_LateCheck(), "ori-late-patch-check")
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
-    from tests.config_layout import release_reexports
+    from tests.package_layout import release_reexports
 
     release_reexports()
 
 
+_PATCH_PROBLEMS = pytest.StashKey[dict[str, list[str]]]()
+
+
+def _patch_problems(item: pytest.Item, when: str, problems: list[str]) -> None:
+    item.stash.setdefault(_PATCH_PROBLEMS, {}).setdefault(when, []).extend(problems)
+
+
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_setup(item: pytest.Item) -> Iterator[None]:
-    """Refuse to start a test once an ``ori.config`` re-export was rebound.
+    """Check the bindings in ``ori.config`` and ``ori.runtime`` a test starts
+    from, and what its fixtures' setup changed.
 
-    The bindings are compared with those taken when the session started, so a
-    write made while a test module was collected is caught at its first test.
+    A write made while a test module was collected is caught at its first test.
     """
-    from tests.config_layout import bindings, rebound
+    from tests.package_layout import begin_phase
 
-    problems = rebound(item.config.stash[_SESSION_CONFIG_BINDINGS])
-    if problems:
-        pytest.fail("\n".join(problems))
-    item.stash[_CONFIG_BINDINGS] = bindings()
-    return (yield)
+    _patch_problems(item, "setup", begin_phase("Left before this test started"))
+    try:
+        return (yield)
+    finally:
+        _patch_problems(item, "setup", begin_phase("In setup"))
 
 
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_call(item: pytest.Item) -> Iterator[None]:
-    """Fail a test whose fixtures or body left an ``ori.config`` re-export rebound."""
-    from tests.config_layout import rebound
+    """Check what the test body changed, however soon it was undone."""
+    from tests.package_layout import check_bindings
 
-    result = yield
-    problems = rebound(item.stash[_CONFIG_BINDINGS])
+    try:
+        return (yield)
+    finally:
+        _patch_problems(item, "call", check_bindings())
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item) -> Iterator[None]:
+    """Check what fixture teardown changed, a module- or session-scope
+    fixture's included, since the last test of its scope runs its teardown."""
+    from tests.package_layout import begin_phase, check_bindings
+
+    # Other plugins' hooks run between the call's check and here.
+    _patch_problems(item, "teardown", begin_phase("Before teardown"))
+    try:
+        return (yield)
+    finally:
+        _patch_problems(item, "teardown", check_bindings())
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    """Fail the phase whose bindings reach no caller, or only some.
+
+    Set on the finished report, outside every other wrapper, so neither
+    ``xfail`` nor a skip can turn the refusal into an expected outcome.
+    """
+    report: pytest.TestReport = yield
+    problems = item.stash.get(_PATCH_PROBLEMS, {}).pop(call.when, [])
     if problems:
-        pytest.fail("\n".join(problems))
-    return result
+        text = "\n".join(problems)
+        if report.failed:
+            report.sections.append(("patch targets", text))
+        else:
+            report.outcome = "failed"
+            report.longrepr = text
+        if hasattr(report, "wasxfail"):
+            del report.wasxfail
+    return report
 
 
 @pytest.fixture(autouse=True)
