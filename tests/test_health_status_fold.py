@@ -80,6 +80,12 @@ def _signing_refused(runtime: OriRuntime) -> None:
     )
 
 
+def _heartbeat_clock_out_of_range(runtime: OriRuntime) -> None:
+    runtime._runtime_node_heartbeat_publisher = SimpleNamespace(  # type: ignore[assignment]
+        clock_out_of_range=True
+    )
+
+
 CONDITIONS: dict[str, tuple[str, Callable[[OriRuntime], None]]] = {
     "decision_record_lost": ("critical", _set("_decision_records_lost", lambda: 1)),
     "liveness_critical": (
@@ -116,6 +122,7 @@ CONDITIONS: dict[str, tuple[str, Callable[[OriRuntime], None]]] = {
         _set("_evidence_health", _evidence_storage_fault),
     ),
     "gateway_signing_refused": ("degraded", _signing_refused),
+    "heartbeat_clock_out_of_range": ("degraded", _heartbeat_clock_out_of_range),
 }
 # Both liveness entries drive the one liveness branch.
 BRANCHES = len(CONDITIONS) - 1

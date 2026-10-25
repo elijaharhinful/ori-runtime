@@ -405,6 +405,13 @@ class HealthSnapshot(Commissioning):
             # reasoning requests, export responses and inbound acks. Degraded,
             # and no token: the vocabulary is closed and carries none for it.
             severities.append("degraded")
+        heartbeat = getattr(self, "_runtime_node_heartbeat_publisher", None)
+        if heartbeat is not None and heartbeat.clock_out_of_range:
+            # A wall clock outside what gateway-api/v2 admits for
+            # `last_seen_ms` sends no node heartbeat, so the site sees this
+            # node go stale; this is where the runtime says why. Degraded, and
+            # no token: the vocabulary is closed and carries none for it.
+            severities.append("degraded")
         if snapshot["evidence"].get("application_storage_fault") is True:
             # The record of what the authority said is what is at risk, so
             # degraded; it gates no action, no Tier D and no safety binding.
