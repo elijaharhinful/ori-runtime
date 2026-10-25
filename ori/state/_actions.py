@@ -31,7 +31,7 @@ class ActionLogStore(StoreCore):
         *,
         attestation_pending: bool = False,
         record_kind: str = "dispatch",
-        record_key: str = "",
+        record_key: str,
         contributed_to: str | None = None,
     ) -> int:
         return await self._run_write(
@@ -64,7 +64,7 @@ class ActionLogStore(StoreCore):
         binding_seq: int | None = None,
         authority_json: str | None = None,
         record_kind: str = "dispatch",
-        record_key: str = "",
+        record_key: str,
         contributed_to: str | None = None,
     ) -> int:
         """Persist action result with sensor/device context for reporting.
@@ -119,7 +119,14 @@ class ActionLogStore(StoreCore):
             "pending" if context_fields.get("attestation_pending") else ""
         )
         record_kind = str(context_fields.get("record_kind", RECORD_DISPATCH))
-        record_key = str(context_fields.get("record_key", "") or "")
+        record_key = context_fields.get("record_key")
+        if not isinstance(record_key, str) or not record_key:
+            # An empty key cannot be named, resolved or deduplicated, and
+            # gateway-api/v2 refuses one on export. Only rows from before
+            # keys hold one, and they are exported as null.
+            raise ValueError(
+                f"action_log: a new row needs a non-empty record_key, got {record_key!r}"
+            )
         contributed_to = context_fields.get("contributed_to")
         _check_action_record_shape(
             record_kind,

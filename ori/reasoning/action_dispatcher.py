@@ -4782,7 +4782,7 @@ class ActionDispatcher:
                     binding_seq=binding_seq,
                     authority_json=authority_json,
                     record_kind=record_kind,
-                    record_key=meta.key if meta is not None else "",
+                    record_key=meta.key if meta is not None else uuid.uuid4().hex,
                     contributed_to=meta.contributed_to if meta is not None else None,
                 )
             else:
@@ -4794,7 +4794,7 @@ class ActionDispatcher:
                     action_result,
                     trigger_name,
                     record_kind=record_kind,
-                    record_key=meta.key if meta is not None else "",
+                    record_key=meta.key if meta is not None else uuid.uuid4().hex,
                     contributed_to=meta.contributed_to if meta is not None else None,
                 )
         except Exception:

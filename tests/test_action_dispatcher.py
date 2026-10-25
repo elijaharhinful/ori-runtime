@@ -7,6 +7,7 @@ import contextlib
 import json
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
@@ -2446,6 +2447,7 @@ class TestFirmwareProvenanceAtomicity:
                 input_firmware_device_id="fw-1",
                 input_firmware_registration=snapshot,
                 attestation_pending=True,
+                record_key=uuid.uuid4().hex,
             )
 
             # Read the raw column directly: it is already populated, with no

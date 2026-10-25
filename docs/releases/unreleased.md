@@ -478,6 +478,13 @@ release is cut.
   recorded as `coalesced` become `contributor_legacy` on every open of the
   store, with no link invented. The gateway and bridge action-log exports do
   not yet carry the record kind, so they still show a contributor as an act.
+- Every action-log row the runtime writes carries a unique `record_key`. An
+  unknown tier, a relay action withheld by `relay.enabled` or the device
+  policy, a Tier D execution without first-party provenance and an execution
+  below the registry floor each logged a row with an empty key, which could
+  not be named or resolved by key and which gateway-api/v2 refuses on export.
+  The store now refuses a new row with an empty key. Rows stored before keys
+  are still exported with `record_key: null` (#859).
 - A host-state approval that fails or is cancelled after its act still
   records its decision, through the same ordered writer as the act, or
   counts it lost when it cannot be queued. The action row records the act
