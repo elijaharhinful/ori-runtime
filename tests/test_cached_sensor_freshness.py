@@ -529,7 +529,7 @@ async def test_a_reconnect_does_not_refresh_an_old_value(
 async def test_an_error_response_keeps_the_last_value_within_the_bound(
     factory: Callable[[], Any], clock: _Clock
 ) -> None:
-    """HTTP and CoAP agree: an error response is a failed poll (#791).
+    """HTTP and CoAP agree: an error response is a failed poll.
 
     The error carries the configured path with another value, which neither
     poller may read, and the last value is still served until the bound.

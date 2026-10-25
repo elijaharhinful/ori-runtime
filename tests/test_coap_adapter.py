@@ -292,7 +292,7 @@ _ERROR_CODES = [
 
 
 class TestCoapResponseCode:
-    """An error response is a failed poll whatever it carries (#791)."""
+    """An error response is a failed poll whatever it carries."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("payload", _ERROR_PAYLOADS)

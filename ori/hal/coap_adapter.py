@@ -22,6 +22,7 @@ from ori.hal.base import (
 )
 from ori.hal.producer_paths import READ_CLOCK, producer_time_for
 from ori.network.events import SensorReading
+from ori.utils.coap_codes import response_code_error
 from ori.utils.path_utils import shown
 from ori.utils.time_utils import now_ms
 
@@ -62,23 +63,6 @@ except ImportError:
 _DEFAULT_POLL_INTERVAL_MS = 10_000
 _DEFAULT_TIMEOUT_S = 2.0
 _ALLOWED_METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
-_SUCCESS_CLASS = 2
-
-
-def _response_code_error(code: object) -> str | None:
-    """Why a response code is not a success, or None for a 2.xx.
-
-    A code is one byte: its class in the top three bits and its detail in the
-    low five (RFC 7252 section 3), which aiocoap's `Code` carries as an int. A
-    code that cannot be read is not taken as a success.
-    """
-    if isinstance(code, bool) or not isinstance(code, int) or not 0 <= code <= 0xFF:
-        return f"a response code that cannot be read ({code!r})"
-    if code >> 5 == _SUCCESS_CLASS:
-        return None
-    dotted = f"{code >> 5}.{code & 0x1F:02d}"
-    name = getattr(code, "name", None)
-    return f"response code {dotted} {name}" if name else f"response code {dotted}"
 
 
 class CoapAdapter(BaseAdapter):
@@ -289,7 +273,7 @@ class CoapAdapter(BaseAdapter):
             # An error response is a failed poll whatever its payload, as an
             # HTTP 4xx or 5xx is: the last value is kept within the silence
             # bound, and the breaker counts it.
-            error = _response_code_error(getattr(response, "code", None))
+            error = response_code_error(getattr(response, "code", None))
             if error is not None:
                 raise AdapterReadError(
                     f"CoapAdapter: uri={self._uri} answered with {error}"

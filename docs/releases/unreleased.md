@@ -446,8 +446,9 @@ release is cut.
   or 5xx is: the circuit breaker counts it and the last value is kept within
   the silence bound. Before, the response code was not checked, so an error
   response with a text or empty payload withdrew the cached value, and one
-  whose JSON payload carried the configured path was read as a reading
-  (#791).
+  whose JSON payload carried the configured path was read as a reading.
+  The CoAP action executor decides success with the same check, so the two
+  cannot drift apart (#791).
 - A sensor source that has not yet published, or whose last payload was
   refused, no longer counts against the circuit breaker, and a fresh value
   closes an open breaker, so a Tier D source that starts late is observed
