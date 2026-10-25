@@ -519,6 +519,14 @@ release is cut.
   stops the heartbeat for the life of the process any longer. A local `critical`
   publishes `degraded`, which a lost decision record previously published as
   `healthy`, until a gateway claims the `gateway-api/v2` heartbeat rules.
+- The node heartbeat no longer publishes a `last_seen_ms` the gateway must
+  refuse. A wall clock at or before the epoch, or past 2^53-1 ms, used to be
+  published as is, so the gateway dropped every heartbeat and the node went
+  stale with nothing on the device saying why. Such a tick now publishes
+  nothing, on the ordinary and the degraded path alike, and is neither
+  clamped nor signed: a WARNING names the value, at most once a minute with
+  the count since, and health reports `degraded` until a tick's clock is
+  back in range (#922).
 
 ## Security
 

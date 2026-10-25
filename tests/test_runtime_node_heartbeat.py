@@ -867,3 +867,103 @@ async def test_a_refusing_signing_clock_sends_nothing_and_logs_no_traceback(
     refusing.stop()
     assert client.published == []
     assert not any(record.exc_info for record in caplog.records)
+
+
+# ── last_seen_ms range (gateway-api/v2 Runtime Node Heartbeat, #922) ────────
+
+_HEALTHY = {"critical": False}
+_MALFORMED = {"critical": "no"}  # takes the degraded fallback path
+_LAST_SEEN_PATHS = [
+    pytest.param(_HEALTHY, "healthy", id="mapped"),
+    pytest.param(_MALFORMED, "degraded", id="fallback"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("snapshot", "status"), _LAST_SEEN_PATHS)
+@pytest.mark.parametrize("clock_ms", [1, 2**53 - 1], ids=["one", "max-exact"])
+async def test_a_last_seen_ms_at_either_end_of_the_range_is_published(
+    monkeypatch, snapshot, status, clock_ms
+):
+    monkeypatch.setattr(node_heartbeat_module, "now_ms", lambda: clock_ms)
+    client = _FakeClient()
+    publisher = _publisher(client=client, snapshot=snapshot)
+    await publisher._publish_once(client)
+
+    payload = json.loads(client.published[0][1])
+    assert payload["last_seen_ms"] == clock_ms
+    assert payload["status"] == status
+    assert publisher.clock_out_of_range is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("snapshot", "status"), _LAST_SEEN_PATHS)
+@pytest.mark.parametrize(
+    "clock_ms", [0, 2**53, -1], ids=["zero", "past-max-exact", "negative"]
+)
+async def test_a_last_seen_ms_outside_the_range_is_not_published(
+    monkeypatch, caplog, snapshot, status, clock_ms
+):
+    monkeypatch.setattr(node_heartbeat_module, "now_ms", lambda: clock_ms)
+    client = _FakeClient()
+    publisher = _publisher(client=client, snapshot=snapshot)
+    with caplog.at_level("WARNING"):
+        await publisher._tick(client)
+
+    assert client.published == []
+    assert publisher.clock_out_of_range is True
+    assert f"wall clock gives last_seen_ms {clock_ms}" in caplog.text
+    assert "no heartbeat was sent" in caplog.text
+    assert "publishing degraded" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_signed_heartbeat_is_not_signed_outside_the_range(monkeypatch):
+    """The check is ahead of signing, so nothing is signed under a bad clock."""
+    monkeypatch.setattr(node_heartbeat_module, "now_ms", lambda: 0)
+
+    class _RecordingSigner:
+        signed = 0
+
+        def sign(self, payload, *, message_type):
+            self.signed += 1
+            return payload
+
+    signer = _RecordingSigner()
+    client = _FakeClient()
+    await _publisher(client=client, authenticator=signer)._publish_once(client)
+    assert client.published == []
+    assert signer.signed == 0
+
+
+@pytest.mark.asyncio
+async def test_the_clock_warning_is_coalesced(monkeypatch, caplog):
+    monkeypatch.setattr(node_heartbeat_module, "now_ms", lambda: 0)
+    client = _FakeClient()
+    publisher = _publisher(client=client)
+    with caplog.at_level("WARNING"):
+        for _ in range(5):
+            await publisher._publish_once(client)
+
+    lines = [r for r in caplog.records if "wall clock gives" in r.getMessage()]
+    assert len(lines) == 1
+    assert client.published == []
+
+
+@pytest.mark.asyncio
+async def test_a_clock_back_in_range_publishes_and_clears(monkeypatch, caplog):
+    clock = {"ms": 2**53}
+    monkeypatch.setattr(node_heartbeat_module, "now_ms", lambda: clock["ms"])
+    client = _FakeClient()
+    publisher = _publisher(client=client)
+
+    await publisher._publish_once(client)
+    assert publisher.clock_out_of_range is True
+    assert client.published == []
+
+    clock["ms"] = 1_000_000
+    with caplog.at_level("INFO"):
+        await publisher._publish_once(client)
+    assert publisher.clock_out_of_range is False
+    assert json.loads(client.published[0][1])["last_seen_ms"] == 1_000_000
+    assert "back in range" in caplog.text

@@ -35,6 +35,7 @@ from ori.gateway.payload_bounds import (
 )
 from ori.security.gateway_messages import GatewayMessageAuthenticator
 from ori.security.signing_clock import SigningClockUnavailableError
+from ori.utils.coalesced_log import CoalescedWarning
 from ori.utils.time_utils import now_ms
 
 try:
@@ -115,6 +116,10 @@ RUNTIME_HEARTBEAT_MESSAGE_TYPE = "runtime.heartbeat"
 DEFAULT_RUNTIME_HEARTBEAT_INTERVAL_S = 30.0
 MIN_RUNTIME_HEARTBEAT_INTERVAL_S = 1.0
 MAX_RUNTIME_HEARTBEAT_INTERVAL_S = 86_400.0
+# gateway-api/v2 Runtime Node Heartbeat: a gateway refuses a heartbeat whose
+# `last_seen_ms` is outside this range.
+LAST_SEEN_MS_MIN = 1
+LAST_SEEN_MS_MAX = 2**53 - 1
 
 
 class MqttRuntimeNodeHeartbeatPublisher:
@@ -151,10 +156,21 @@ class MqttRuntimeNodeHeartbeatPublisher:
         self._authenticator = authenticator
         self._client_factory = client_factory or _default_client_factory
         self._client: Any = None
+        self._clock_log = CoalescedWarning(logger)
+        self._clock_out_of_range = False
 
     @property
     def topic(self) -> str:
         return RUNTIME_HEARTBEAT_TOPIC_TEMPLATE.format(device_id=self._device_id)
+
+    @property
+    def clock_out_of_range(self) -> bool:
+        """Whether the last tick was refused for a wall clock outside the range.
+
+        Cleared by the first tick whose clock is back in range, whether or not
+        its publish then succeeds.
+        """
+        return self._clock_out_of_range
 
     async def serve_until(self, shutdown_event: asyncio.Event) -> None:
         """Connect to MQTT and publish node heartbeat until shutdown."""
@@ -218,6 +234,11 @@ class MqttRuntimeNodeHeartbeatPublisher:
 
     async def _publish_once(self, client: Any) -> None:
         payload = await self._payload()
+        # Every path below, the degraded fallbacks included, publishes this
+        # `last_seen_ms`, so one check covers them all. Clamping it would put
+        # a time the runtime never read under its name.
+        if not self._clock_in_range(payload["last_seen_ms"]):
+            return
         try:
             body = self._fitted(payload)
         except SigningClockUnavailableError:
@@ -241,6 +262,25 @@ class MqttRuntimeNodeHeartbeatPublisher:
         rc = getattr(info, "rc", 0)
         if rc != 0:
             raise RuntimeError(f"the broker client refused the publish (rc={rc})")
+
+    def _clock_in_range(self, last_seen_ms: int) -> bool:
+        if LAST_SEEN_MS_MIN <= last_seen_ms <= LAST_SEEN_MS_MAX:
+            if self._clock_out_of_range:
+                logger.info(
+                    "[runtime-heartbeat] wall clock is back in range; publishing again"
+                )
+            self._clock_out_of_range = False
+            return True
+        self._clock_out_of_range = True
+        self._clock_log.warn(
+            "clock",
+            "[runtime-heartbeat] wall clock gives last_seen_ms %d, outside the "
+            "%d..%d gateway-api/v2 admits; no heartbeat was sent",
+            last_seen_ms,
+            LAST_SEEN_MS_MIN,
+            LAST_SEEN_MS_MAX,
+        )
+        return False
 
     def _fitted(self, payload: dict[str, Any]) -> bytes:
         """*payload* encoded with only the `active_triggers` its maximum holds.
