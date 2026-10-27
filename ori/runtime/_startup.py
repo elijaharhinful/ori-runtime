@@ -4,13 +4,17 @@
 """The later startup stages, from reasoning to the announcement, and ``start()``."""
 
 import asyncio
+import functools
 import logging
 import signal
+from typing import Any
 
 from ori.config import ConfigValidationError, requires_production_posture
 from ori.gateway.envelope_auth import (
     build_gateway_envelope_state as _build_gateway_envelope_state,
 )
+from ori.hal.base import AdapterUnavailableError, BaseAdapter
+from ori.hal.mqtt_base import reconnect_delay
 from ori.hal.protocol_registry import UnknownProtocolError, make_adapter
 from ori.hardware.led_indicator import RuntimeHealthState
 from ori.network.deduplicator import EventDeduplicator
@@ -59,6 +63,7 @@ from ori.runtime._sensors import SensorPolling
 from ori.runtime._services import OperatorServices
 from ori.runtime._shutdown import Shutdown
 from ori.security.firmware.controller_profiles import ControllerAlarmTracker
+from ori.security.firmware.reading_age import liveness_bound
 from ori.sensor_connection import note_unconnected_sensor
 from ori.skills.loader import SkillLoader
 from ori.skills.selection import log_tier_configuration, skills_dir_for
@@ -137,11 +142,20 @@ class StartupStages(
         gateway_reasoner = build_gateway_reasoner(
             context.config, context.gateway_envelope_state
         )
+        if gateway_reasoner is not None:
+            self._gateway_ingress.add(gateway_reasoner.ingress)
         context.elevator = IntelligenceElevator(
             local_llm=context.local_llm,
             gateway_reasoner=gateway_reasoner,
             config=context.config.reasoning,
             context_enricher=build_context_enricher(context.config),
+            # Set by the dispatcher stage; a prompt's {time} names a firmware
+            # reading's liveness bound only where this process signed it.
+            liveness_bound=(
+                None
+                if self._firmware_reading_age is None
+                else functools.partial(liveness_bound, self._firmware_reading_age)
+            ),
         )
 
     async def _stage_event_path(self, context: StartupContext) -> None:
@@ -290,18 +304,28 @@ class StartupStages(
                 raise ConfigValidationError(str(exc)) from exc
             connect_cfg = adapter_connect_config(sensor_cfg, context.config)
             connected = True
+            unavailable = False
             try:
                 await adapter.connect(connect_cfg)
+            except AdapterUnavailableError as exc:
+                logger.warning(
+                    "[runtime] sensor_id=%s source not reached at start (%s)",
+                    sensor_cfg.id,
+                    exc,
+                )
+                connected = False
+                unavailable = True
             except Exception:
                 logger.exception(
                     "[runtime] failed to connect adapter for sensor_id=%s — skipping",
                     sensor_cfg.id,
                 )
                 connected = False
-            retrying = connected and adapter.connection_retrying
+            retrying = unavailable or (connected and adapter.connection_retrying)
             if connected:
                 # Before any await, so a stop during the notice still closes it.
                 self._adapters.append(adapter)
+            if connected or unavailable:
                 self._sensor_poll_interval_ms[sensor_cfg.id] = (
                     sensor_cfg.poll_interval_ms
                 )
@@ -314,6 +338,13 @@ class StartupStages(
                     registry=self._safety_registry,
                     send=self._safety_notice_sender(),
                 )
+            if unavailable:
+                self._background_tasks.append(
+                    asyncio.create_task(
+                        self._connect_when_available(sensor_cfg, connect_cfg, context),
+                        name=f"connect:{sensor_cfg.id}",
+                    )
+                )
             if not connected:
                 continue
             if not retrying:
@@ -324,22 +355,84 @@ class StartupStages(
                     adapter.adapter_name,
                     sensor_cfg.id,
                 )
+            self._start_polling(adapter, sensor_cfg, context)
 
-            task = asyncio.create_task(
-                self._poll_sensor(
-                    adapter,
-                    sensor_cfg,
-                    context.event_bus,
-                    context.config.device.id,
-                    self._deduplicator,
-                    context.config.device.timezone,
-                    context.config.device.country_code,
-                    context.config.device.location,
-                    context.config.device.site_type,
-                ),
-                name=f"poll:{sensor_cfg.id}",
+    async def _connect_when_available(
+        self, sensor_cfg: Any, connect_cfg: dict[str, Any], context: StartupContext
+    ) -> None:
+        """Retry a source not there at start until it answers, then poll it.
+
+        A fresh adapter per attempt, under the reconnect back-off a dropped
+        broker gets, until a stop cancels this task. The sensor stays
+        unconnected, and health degraded, until its first accepted reading. An
+        error that does not say the source is absent ends the retries and is
+        reported as the start would have reported it.
+        """
+        attempt = 0
+        last_reason = ""
+        while True:
+            await asyncio.sleep(reconnect_delay(attempt))
+            attempt += 1
+            adapter = make_adapter(sensor_cfg.protocol)
+            # Held, and the connect shielded, before the await: a stop cancels
+            # this task, never the connect, so the adapter's own close at
+            # shutdown waits for it and gives back whatever it opened.
+            self._adapters.append(adapter)
+            try:
+                await asyncio.shield(adapter.connect(connect_cfg))
+            except AdapterUnavailableError as exc:
+                self._adapters.remove(adapter)
+                if str(exc) != last_reason:
+                    last_reason = str(exc)
+                    logger.warning(
+                        "[runtime] sensor_id=%s still not reached (attempt %d): %s",
+                        sensor_cfg.id,
+                        attempt,
+                        exc,
+                    )
+                continue
+            except Exception:
+                self._adapters.remove(adapter)
+                logger.exception(
+                    "[runtime] sensor_id=%s can no longer be connected; not retried",
+                    sensor_cfg.id,
+                )
+                self._retrying_sensors_announced.discard(str(sensor_cfg.id))
+                await note_unconnected_sensor(
+                    str(sensor_cfg.id),
+                    retrying=False,
+                    unconnected=self._unconnected_sensors,
+                    announced=self._retrying_sensors_announced,
+                    registry=self._safety_registry,
+                    send=self._safety_notice_sender(),
+                )
+                return
+            logger.info(
+                "[runtime] sensor_id=%s source reached after %d attempt(s)",
+                sensor_cfg.id,
+                attempt,
             )
-            self._background_tasks.append(task)
+            self._start_polling(adapter, sensor_cfg, context)
+            return
+
+    def _start_polling(
+        self, adapter: BaseAdapter, sensor_cfg: Any, context: StartupContext
+    ) -> None:
+        task = asyncio.create_task(
+            self._poll_sensor(
+                adapter,
+                sensor_cfg,
+                context.event_bus,
+                context.config.device.id,
+                self._deduplicator,
+                context.config.device.timezone,
+                context.config.device.country_code,
+                context.config.device.location,
+                context.config.device.site_type,
+            ),
+            name=f"poll:{sensor_cfg.id}",
+        )
+        self._background_tasks.append(task)
 
     async def _stage_loops(self, context: StartupContext) -> None:
         if self._sensor_poll_interval_ms:
@@ -490,6 +583,7 @@ class StartupStages(
             else None
         )
         if hb_subscriber is not None:
+            self._gateway_ingress.add(hb_subscriber.ingress)
             self._background_tasks.append(
                 asyncio.create_task(
                     hb_subscriber.serve_until(self._shutdown_event),
@@ -502,6 +596,7 @@ class StartupStages(
         )
         self._evidence_inbound_subscriber = evidence_inbound_subscriber
         if evidence_inbound_subscriber is not None:
+            self._gateway_ingress.add(evidence_inbound_subscriber.ingress)
             self._background_tasks.append(
                 asyncio.create_task(
                     evidence_inbound_subscriber.serve_until(self._shutdown_event),
@@ -524,29 +619,7 @@ class StartupStages(
             )
             logger.info("[runtime] evidence anchor registration reconciler started")
 
-        evidence_outbound_publisher = build_evidence_outbound_publisher(
-            context.config, context.evidence_attestor, context.gateway_envelope_state
-        )
-        self._evidence_outbound_publisher = evidence_outbound_publisher
-        if (
-            evidence_outbound_publisher is not None
-            and context.evidence_attestor is not None
-        ):
-            context.evidence_attestor.set_sealed_listener(
-                evidence_outbound_publisher.nudge
-            )
-            self._background_tasks.append(
-                asyncio.create_task(
-                    evidence_outbound_publisher.serve_until(self._shutdown_event),
-                    name="evidence-outbound",
-                )
-            )
-            self._background_tasks.append(
-                asyncio.create_task(
-                    self._evidence_checkpoint_loop(context.evidence_attestor),
-                    name="evidence-checkpoint",
-                )
-            )
+        self._start_evidence_outbound(context)
 
         # Built here, not read back from the subscriber, so health reaches the
         # documents and alarm snapshots without holding anything of the stack.
@@ -583,6 +656,9 @@ class StartupStages(
 
         if firmware_command_pair is not None:
             publisher, service = firmware_command_pair
+            # Held before connect() so health reports the loop `starting`, under
+            # the startup deadline, rather than disabled while egress connects.
+            self._firmware_liveness_scheduler = firmware_liveness_scheduler
             try:
                 await publisher.connect()
             except Exception:
@@ -601,13 +677,39 @@ class StartupStages(
             # it. Sequence gaps are legal, but burning them on a race is
             # not a cost to accept when ordering is free.
             if firmware_liveness_scheduler is not None:
-                self._firmware_liveness_scheduler = firmware_liveness_scheduler
                 self._background_tasks.append(
                     asyncio.create_task(
                         firmware_liveness_scheduler.serve_until(self._shutdown_event),
                         name="firmware-liveness",
                     )
                 )
+
+    def _start_evidence_outbound(self, context: StartupContext) -> None:
+        """Build the outbound evidence route, and serve it when evidence is on."""
+        evidence_outbound_publisher = build_evidence_outbound_publisher(
+            context.config, context.evidence_attestor, context.gateway_envelope_state
+        )
+        self._evidence_outbound_publisher = evidence_outbound_publisher
+        if (
+            evidence_outbound_publisher is not None
+            and context.evidence_attestor is not None
+        ):
+            self._gateway_ingress.add(evidence_outbound_publisher.ingress)
+            context.evidence_attestor.set_sealed_listener(
+                evidence_outbound_publisher.nudge
+            )
+            self._background_tasks.append(
+                asyncio.create_task(
+                    evidence_outbound_publisher.serve_until(self._shutdown_event),
+                    name="evidence-outbound",
+                )
+            )
+            self._background_tasks.append(
+                asyncio.create_task(
+                    self._evidence_checkpoint_loop(context.evidence_attestor),
+                    name="evidence-checkpoint",
+                )
+            )
 
     async def _stage_operator_services(self, context: StartupContext) -> None:
         await self._start_firmware_mqtt_operator_if_enabled(context.config)

@@ -5,6 +5,25 @@ release is cut.
 
 ## Upgrade notes
 
+- Every `skill.yaml` value the loader reads, apart from the skill's own
+  `config` values, now has one YAML type, checked before any is used:
+  strings for names, conditions, tiers and policies, integers for
+  `cooldown_seconds` and `approval_timeout_seconds`, YAML booleans for
+  `bypass_llm` and `requires_approval`, lists for `triggers`,
+  `sensors_required`, `actions.available` and each `actions.defaults` entry,
+  and mappings for `actions`, `prompts` and `config`. A value of another type
+  refuses the skill with the field and the type it received, including
+  `null` (an empty `prompts:`, `reasoning_policy:` or `sensors_required:`)
+  and a float where an integer is expected (`cooldown_seconds: 10.0`). Before,
+  a quoted number such as `cooldown_seconds: "10"` was converted, a float was
+  truncated, an empty value read as none, and `bypass_llm: "no"` read as true.
+  An action's `tier`, when present, must be a tier letter, in either case as
+  before; any other value, `tier: ""` included, is refused rather than read
+  as Tier A or as omitted. A condition longer than 4,096 characters is
+  refused at load and by the engine. A negative
+  `cooldown_seconds` is refused, and a trigger whose condition the rule engine
+  cannot evaluate, or a Tier D trigger with no condition, refuses the skill.
+  Write each value in its own type.
 - `skills:` in `ori.yaml` is now the list of skills that run. Each name
   resolves to the skill of that name that ships with the runtime, or to that
   directory under `skills_dir` (default: `skills` beside `ori.yaml`). A
@@ -127,6 +146,32 @@ release is cut.
 
 ## Added
 
+- Health names the devices this runtime signs nothing for:
+  `firmware_liveness.undeclared_device_ids` lists every held device whose
+  accepted manifest does not declare `runtime_key_domains`, re-read from the
+  registry for every snapshot, so a device enters the set when its manifest is
+  accepted and leaves it when a declaring one is, with no restart. Such a
+  device is never counted in `supervised_devices` or listed in
+  `expiring_device_ids`, and a non-empty set degrades `status`. The
+  `firmware_signing_domains_undeclared` token is not named yet: a gateway
+  refuses a heartbeat carrying a token outside its vocabulary, so it waits for
+  gateways that accept it (runtime-health/v4). Manifests that cannot be listed
+  make `firmware_liveness.state` `unavailable` and `status` critical, never an
+  empty set. The block also carries `state` (`disabled`, `starting`,
+  `unavailable` or `available`). A liveness loop not yet started is `starting`
+  and degrades `status`; one still not started 300 seconds after the process
+  started is `unavailable` and makes it critical, so a hung start is never
+  reported healthy.
+- Health reports `mqtt_ingress`: for each gateway-to-runtime route the runtime
+  built, how many messages it refused for size (`payload_too_large`), dropped
+  for volume (`volume_dropped`: past the family's rate or its work in flight)
+  and refused under the Payload Member Rule (`member_refused`), since the
+  process started. A message left for the broker to redeliver is not counted:
+  inbound evidence past its rate or its work in flight is left that way,
+  so it is never `volume_dropped`.
+  The block is `disabled` with no gateway configured and contributes no
+  condition (runtime-health/v4).
+
 - The Tier C approver registry, built against the `tier-c-approvers/v1`
   draft: the runtime-owned record of who may approve a Tier C action, bound to
   the device, a verified `device.site_id` and an identity epoch the runtime
@@ -197,6 +242,13 @@ release is cut.
   and neither affects `status`.
 
 ## Changed
+
+- The gateway `health` export no longer carries device identifiers from
+  `firmware_liveness`: `expiring_device_ids` is exported as
+  `expiring_device_count`, and `undeclared_device_ids` as
+  `undeclared_device_count` (runtime-health/v4 keeps both sets on the device),
+  and its free-text `last_error` is no longer exported. The local health
+  socket still serves all three.
 
 - A firmware manifest may declare `command_results:
   "firmware-command-result/v1"` (`firmware-telemetry/v2` Command Results); any
@@ -329,6 +381,76 @@ release is cut.
   script importing one of the old module paths must use the new one.
 
 ## Fixed
+
+- A Tier D trigger's `cooldown_seconds` no longer delays its next Tier D
+  attempt. After an attempt that ran or failed, the rule engine reported no
+  match for the length of the cooldown, however often the condition held. A
+  trip is now dispatched on every matching reading, and the cooldown governs
+  only the trigger's other actions, so its notices come once per window
+  instead of once per reading. A Tier D trigger whose plan holds no Tier D
+  act, one that only notifies, keeps its cooldown. Every bundled Tier D
+  trigger declares `cooldown_seconds: 0` and is unaffected.
+
+- A skill prompt no longer presents a reading's arrival as the time it was
+  measured. For a firmware reading, and any pushed reading whose producer
+  reported no measurement time, `{time}` now reads "not reported by device;
+  arrived at the runtime at …", with the runtime liveness bound before it
+  where this runtime signed the reading's nonce. `{history.fetch_history()}`
+  rows carry `measured_at` or `arrived_at` in place of `timestamp`, and
+  `{history.last_timestamp()}` names an arrival as one. A time of unstated
+  basis is not shown. The runtime's own prompt line reads "Value", not
+  "Current value". `{time}` also keeps its colons, which the prompt sanitiser
+  used to strip. A hook's `history.fetch_history()` rows gain `producer_time`.
+
+- The skill loader no longer crashes on, or admits, a manifest value of the
+  wrong type. `action_tier: [D]`, a list in `actions.defaults` or a
+  non-numeric `cooldown_seconds` raised a `TypeError` or `ValueError` (a
+  traceback from `ori skills validate`, and the skill silently dropped by a
+  full load); `condition: ["value > 1"]` loaded, so a Tier D trigger's
+  protective condition could never fire; a list or number as a
+  `safe_default_action` or an action's `tier` was read as its text. Each is
+  now a refusal naming the skill, the trigger or action, the field and the
+  type received. A condition the rule engine cannot evaluate, a blank one, an
+  unknown or misused `history` helper, one longer than 4,096 characters, and
+  text the parser cannot take included, is refused at load by the engine's
+  own complete check, and a Tier D trigger must have a condition. Before, one such condition anywhere in a
+  skill made the engine raise for every trigger of that skill, so its Tier D
+  triggers were suspended along with it. Every refusal is bounded to 1,000
+  characters, keeping its start and its end, whatever the manifest put in it. A condition that parses but compares a
+  reading with text is still found only when it is evaluated.
+
+- A sensor whose source cannot be reached when the runtime starts is no
+  longer skipped until a restart. An OPC-UA server, a serial or USB-serial
+  device (one to auto-detect included), or an I2C device that is not there
+  yet is connected again in the background, under the same bounded, jittered
+  back-off as a dropped MQTT broker, with a fresh adapter each attempt; the
+  sensor stays unconnected, and health degraded, until its first reading is
+  accepted, and the operator is told when it is. Whether a failure is retried
+  is decided by what caused it: a device absent or busy, a host refusing or
+  unreachable, or a timeout is retried; a permission error, a malformed value
+  or a refused login is final, as before, and if a retry meets one the
+  operator and the safety registry are told that the sensor is no longer
+  being read. HTTP, CoAP, Growatt and Solarman sensors recover their data on
+  their own, since their connect does not reach the source, but while such a
+  source is down at start health reads it as connected (ori-runtime#958).
+
+- A cancelled dispatch now hands the cancellation back to whoever cancelled
+  it, once the attempt is recorded. Before, the dispatcher recorded the
+  attempt and returned normally, so a shutdown or a superseding task could not
+  tell it had been honoured. Recording is unchanged: an approval workflow
+  still finishes its decision record and the act's row, approval and proposal
+  included, and a failed Tier D act still sends its emergency notice, before
+  the cancellation is handed back. A Tier D act whose shielded executor is
+  still driving still answers with its uncertain result, and one that had
+  finished when the cancellation arrived is now recorded as it ran rather
+  than as not executed. Three handlers of the same kind no longer misread a
+  cancellation: a Tier D executor task that ends cancelled, as a loop-wide
+  cancel can leave one before it runs, while the resource gate holds its
+  command as uncertain now releases it as not accepted (it stayed uncertain
+  until shutdown, refusing the opposite command), a cancelled safety-trip
+  intent append is logged as a failed append and the trip command still
+  proceeds, and the deadline callback for that append no longer logs a
+  cancellation as an error.
 
 - Every action-log row carries a `record_key`. A refusal for an unrecognised
   tier, a relay action suppressed by policy, a Tier D action from a skill
@@ -573,6 +695,40 @@ release is cut.
 
 ## Security
 
+- Authenticated inbound input now binds exactly what was received. Before, a
+  remote command's HMAC was computed over normalised fields: `command_id` and
+  `device_id` were stripped of Unicode whitespace and `command` was stripped
+  and upper-cased, so one tag verified many wire payloads (`ſet_threshold`
+  read as `SET_THRESHOLD`). No authority was gained, but the signed command
+  and the one received could differ. Now:
+  - a remote command's `command_id` is 1 to 128 of `[A-Za-z0-9._-]`, its
+    `command` an ASCII upper-case name compared case-sensitively,
+    `issued_at_ms` a JSON integer and `args` an object (signed, as before, as
+    canonical JSON); any other value is refused before verification. A
+    producer that sent a lower-case `command`, a string timestamp or a null
+    `args` must send the exact form;
+  - inbound sender identities fold ASCII only, so a non-ASCII digit no longer
+    survives into the identity used for allowlisting and lockout.
+    `actions.operator_contact`, `actions.secondary_contact` and
+    `security.remote_commands.allowed_senders` may still contain spaces of any
+    kind, which are removed at load so every provider call receives the
+    number the allowlist matches (an alert already queued with spaces in its
+    recipient has them removed when it is sent), but one holding any other non-ASCII
+    character now refuses the start;
+  - the SMS webhook compares its token as bytes in constant time and refuses
+    headers that are not UTF-8, a non-ASCII header name, whitespace before a
+    colon, a folded header line, a repeated authentication or framing header,
+    `Transfer-Encoding`, bytes past `Content-Length`, and a `Content-Length`
+    that is empty or not ASCII digits. Its HMAC is verified over the timestamp
+    and nonce text exactly as sent, so a signing bridge must send the text it
+    signed; the timestamp is 1 to 16 ASCII digits and the nonce visible ASCII
+    without spaces;
+  - a Tier C approval reply is case-folded and trimmed in ASCII only, so a
+    look-alike letter in its yes/no word or proposal id no longer reads as an
+    approval. Every ASCII reply is classified as before; a reply that opens
+    with non-ASCII whitespace, such as a non-breaking space, is now invalid,
+    and SMS ingress keeps that character rather than trimming it away.
+
 - A `skills` directory beside the installed `ori` package is no longer
   first-party. On a wheel install that directory is `site-packages/skills`,
   where any distribution can install files, and a skill there loaded with
@@ -632,7 +788,8 @@ release is cut.
   commands, the SMS webhook body, fetched and cached device policy, the
   shipped safety profile set, the evidence chain's signed envelopes, and
   operator-supplied manifest and evidence files, alongside the readers that
-  already refused one. A guard over all of `ori/` requires the hook at every
+  already refused one. For device policy this goes beyond
+  `device-policy/v2`, which does not state it. A guard over all of `ori/` requires the hook at every
   JSON decode, or an exemption that says why a repeat is harmless there.
 
 - With `gateway.auth.enabled: true`, a gateway reasoning response whose
@@ -689,8 +846,8 @@ release is cut.
   2,000,000 history rows. An oversized inbound evidence message is released
   at the broker so it is not redelivered without end, and one past the rate
   is left with the broker for redelivery. Refusals are logged by topic
-  family, reason and size class, never by contents or device, until
-  runtime-health/v4 names a field for them. As a producer, the runtime never
+  family, reason and size class, never by contents or device, and counted in
+  health's `mqtt_ingress`. As a producer, the runtime never
   publishes a reasoning request over its maximum, fits each export page and
   runtime heartbeat to its topic's maximum (ending an export with
   `item_exceeds_payload_maximum` where one item cannot fit alone), and lists

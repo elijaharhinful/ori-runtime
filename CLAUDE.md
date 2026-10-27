@@ -195,7 +195,7 @@ confer Tier D**. Provenance is not a stopgap awaiting that contract; for Tier D
 it is the answer. An issuer that could grant Tier D would give autonomous safety
 authority an expiry, a revocation path and a holder the runtime never reviewed —
 which is why `device_policy.py` returns for Tier D before it consults expiry at
-all. Safety authority that can go stale contradicts the 2 a.m. outage this
+all, as `device-policy/v2.md` in `ori-specs` requires. Safety authority that can go stale contradicts the 2 a.m. outage this
 runtime exists for.
 
 **Provenance is containment, not the final model.** It is the answer against a
@@ -250,9 +250,11 @@ DISCOVERY BARRIER — one event, every eligible skill, evaluated exhaustively
     and their acts attempted before any hook runs or any history is read; the
     loader refuses a Tier D condition naming anything else.
     Declaration order decides nothing. A trigger in cooldown does not match,
-    and neither does one with a cooldown whose own plan is still in flight —
-    except a plan granting Tier D, which is never held; cooldown is charged
-    later, against the outcome the trigger reached.
+    and neither does one with a cooldown whose own plan is still in flight.
+    No cooldown or in-flight hold reads or charges against a Tier D attempt:
+    a plan granting Tier D dispatches it on every matching reading, and only
+    its other actions wait. Cooldown is charged later, against the outcome
+    those other actions reached.
     │
     ▼
 THE PLAN — each matched trigger's actions, each at its own authority
@@ -602,7 +604,9 @@ class ActionDispatcher:
         #    within approval_timeout_seconds (default: 300)
         # 3. Scoped YES → execute action
         # 4. Scoped NO, invalid reply, or timeout → execute safe_default_action
-        # 5. No response after 2x timeout → escalate to secondary_contact
+        # 5. On timeout, after the safe default, notify actions.secondary_contact
+        #    once. The notice carries no approval authority, and nothing re-asks:
+        #    a new proposal needs the trigger to fire again.
         ...
 
     async def _governed_approval_workflow(self, action, context, result, ...) -> ActionResult:
@@ -617,7 +621,8 @@ class ActionDispatcher:
         #    executor; the dispatch marker lands beside it; the outcome is appended
         #    after it and retried while the process lives.
         # 4. Expired, rejected, blocked, or changed: one non-actuating safe-default
-        #    intent per proposal, the operator told why.
+        #    intent per proposal, the operator told why. Expiry also notifies
+        #    actions.secondary_contact once, as in step 5 above.
         ...
 ```
 
@@ -1179,7 +1184,6 @@ async def test_tier_d_bypasses_dispatcher():
 # Alert delivery
 OWNER_WHATSAPP_NUMBER=whatsapp:+234XXXXXXXXXX
 OWNER_PHONE_NUMBER=+234XXXXXXXXXX
-SECONDARY_WHATSAPP=whatsapp:+234XXXXXXXXXX  # Escalation contact for Tier C no-response
 ORI_SMS_WEBHOOK_TOKEN=                # Shared token for inbound SMS webhook
 ORI_SMS_WEBHOOK_HMAC_SECRET=          # Required when webhook signature mode != token_only
 

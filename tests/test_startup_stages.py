@@ -128,7 +128,7 @@ SURFACE: dict[str, tuple[set[str], set[str], set[str]]] = {
         },
     ),
     "reasoning": (
-        {"_config_path"},
+        {"_config_path", "_firmware_reading_age", "_gateway_ingress"},
         {"_capability_posture_tracker", "_gateway_envelope_state"},
         set(),
     ),
@@ -176,13 +176,12 @@ SURFACE: dict[str, tuple[set[str], set[str], set[str]]] = {
             "_adapters",
             "_background_tasks",
             "_connected_sensor_ids",
-            "_deduplicator",
             "_retrying_sensors_announced",
             "_safety_registry",
             "_unconnected_sensors",
         },
         {"_sensor_last_seen_ms", "_sensor_poll_interval_ms"},
-        {"_poll_sensor", "_safety_notice_sender"},
+        {"_connect_when_available", "_safety_notice_sender", "_start_polling"},
     ),
     "loops": (
         {"_background_tasks", "_deduplicator", "_sensor_poll_interval_ms"},
@@ -206,13 +205,13 @@ SURFACE: dict[str, tuple[set[str], set[str], set[str]]] = {
             "_firmware_alarm_tracker",
             "_firmware_profile_library",
             "_firmware_reading_age",
+            "_gateway_ingress",
             "_nudge_firmware_confirmations",
             "_shutdown_event",
             "_state_store",
         },
         {
             "_evidence_inbound_subscriber",
-            "_evidence_outbound_publisher",
             "_firmware_alarm_tracker",
             "_firmware_command_publisher",
             "_firmware_command_service",
@@ -221,8 +220,8 @@ SURFACE: dict[str, tuple[set[str], set[str], set[str]]] = {
             "_firmware_profile_library",
         },
         {
-            "_evidence_checkpoint_loop",
             "_evidence_registration_loop",
+            "_start_evidence_outbound",
             "_start_gateway_export_responder_if_enabled",
             "_start_sms_webhook_if_enabled",
             "_start_telemetry_export_if_enabled",
@@ -327,8 +326,13 @@ def _surface(method: ast.AsyncFunctionDef) -> tuple[set[str], set[str], set[str]
     return reads, writes, calls
 
 
-def _context_uses(method: ast.AsyncFunctionDef) -> tuple[set[str], set[str]]:
-    """The context fields a stage's body loads and stores."""
+def _context_uses(
+    method: ast.AsyncFunctionDef | ast.FunctionDef, seen: set[str] | None = None
+) -> tuple[set[str], set[str]]:
+    """The context fields a stage loads and stores, in its body and in every
+    runtime method it hands its context to."""
+    methods = runtime_methods()
+    seen = set() if seen is None else seen
     loads: set[str] = set()
     stores: set[str] = set()
     for node in ast.walk(method):
@@ -338,6 +342,22 @@ def _context_uses(method: ast.AsyncFunctionDef) -> tuple[set[str], set[str]]:
             and node.value.id == "context"
         ):
             (stores if isinstance(node.ctx, ast.Store) else loads).add(node.attr)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr in methods
+            and node.func.attr not in seen
+            and any(
+                isinstance(arg, ast.Name) and arg.id == "context"
+                for arg in [*node.args, *(kw.value for kw in node.keywords)]
+            )
+        ):
+            seen.add(node.func.attr)
+            more_loads, more_stores = _context_uses(methods[node.func.attr], seen)
+            loads |= more_loads
+            stores |= more_stores
     return loads, stores
 
 
