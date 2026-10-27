@@ -132,6 +132,8 @@ class TestCoAPAction:
     @pytest.mark.parametrize(
         "code",
         [
+            pytest.param(_Code(0x00, "0.00 EMPTY"), id="0.00"),
+            pytest.param(_Code(0x20, "1.00 (unknown)"), id="1.00"),
             pytest.param(UNAUTHORIZED, id="4.01"),
             pytest.param(_Code(163, "5.03 Service Unavailable"), id="5.03"),
             pytest.param(_Code(255, "7.31 (unknown)"), id="unregistered-class"),
